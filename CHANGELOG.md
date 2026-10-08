@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.6.0 — TBD
+
+### Dashboard
+
+- Added a **Project Skills** section: a token chart and a table per project skill (from the project's `.claude/skills/` or `.agents/skills/`) with Uses, Auto / User split, Turns, Duration, estimated load tokens, Input, Output, Cache Read, Cache Creation, total Tokens, and Est. Cost, plus CSV export. A run's tokens are the main-thread turns after the skill loads, up to the next user prompt or skill load. User-level, plugin, and built-in commands are excluded.
+
+### Scanner
+
+- Added a `skill_events` table that records project-skill loads (model-started via the Skill tool, or typed as `/skill-name`) and user-prompt boundaries, with a one-time backfill for transcripts scanned before this version.
+
 ## v1.5.5 — 2026-07-10
 
 ### Dashboard

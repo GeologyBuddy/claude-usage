@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 # runtime version has to live here as a constant. Keep this in lockstep with the
 # top CHANGELOG heading and vscode-extension/package.json (a parity test guards
 # all three; see tests/test_version.py).
-VERSION = "1.5.5"
+VERSION = "1.6.0"
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
@@ -101,6 +101,18 @@ def init_db(conn):
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS skill_events (
+            uuid        TEXT PRIMARY KEY,
+            session_id  TEXT,
+            timestamp   TEXT,
+            kind        TEXT,
+            skill       TEXT,
+            source      TEXT,
+            load_chars  INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_events_session
+            ON skill_events(session_id, timestamp);
 
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
@@ -219,6 +231,110 @@ def _backfill_topics(conn, jsonl_files):
             "AND (topic IS NULL OR topic = '')", (title, sid))
     conn.commit()
     return len(titles)
+
+
+SKILL_BODY_PREFIX = "Base directory for this skill:"
+
+
+def _is_project_skill_dir(base_dir):
+    """True unless the skill lives under ~/.claude or ~/.agents (user-level
+    skills and plugin skills, which Claude Code caches in ~/.claude/plugins).
+    base_dir must already be normalized to forward slashes."""
+    norm = base_dir.lower()
+    home = str(Path.home()).replace("\\", "/").rstrip("/").lower()
+    return not any(norm.startswith(f"{home}/{d}/") for d in (".claude", ".agents"))
+
+
+def _user_text(record):
+    """Return the text of a user record's message, or None if it carries a
+    tool_result (a tool reply, not something the user typed)."""
+    content = (record.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    texts = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "tool_result":
+            return None
+        if item.get("type") == "text":
+            texts.append(item.get("text") or "")
+    return "\n".join(texts) if texts else None
+
+
+def extract_skill_event(record):
+    """Classify a main-thread user record as a skill load or a real prompt.
+
+    Both the Skill tool and a typed /skill-name inject the SKILL.md body as an
+    isMeta user record starting "Base directory for this skill: <path>"; the
+    tool path also sets sourceToolUseID. Only project skills are kept. A real
+    prompt (non-meta user text) is recorded so the dashboard knows where a
+    skill's active window ends — its text is not stored.
+    """
+    if record.get("type") != "user" or record.get("isSidechain"):
+        return None
+    uuid, session_id = record.get("uuid"), record.get("sessionId")
+    if not uuid or not session_id:
+        return None
+    text = _user_text(record)
+    if text is None:
+        return None
+    event = {"uuid": uuid, "session_id": session_id,
+             "timestamp": record.get("timestamp", ""),
+             "kind": "prompt", "skill": None, "source": None, "load_chars": None}
+    if record.get("isMeta"):
+        if not text.startswith(SKILL_BODY_PREFIX):
+            return None
+        first_line = text[len(SKILL_BODY_PREFIX):].split("\n", 1)[0]
+        base_dir = first_line.strip().replace("\\", "/").rstrip("/")
+        if not _is_project_skill_dir(base_dir):
+            return None
+        event.update(kind="skill",
+                     skill=base_dir.rsplit("/", 1)[-1],
+                     source="auto" if record.get("sourceToolUseID") else "user",
+                     load_chars=len(text))
+    return event
+
+
+def parse_skill_events(filepath, skip_lines=0):
+    """Read skill-load and prompt events from a transcript, past skip_lines."""
+    events = []
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                # Cheap prefilter: every event is a user record.
+                if n <= skip_lines or '"user"' not in line:
+                    continue
+                try:
+                    event = extract_skill_event(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+                if event:
+                    events.append(event)
+    except Exception as e:
+        print(f"  Warning: error reading {filepath}: {e}")
+    return events
+
+
+def insert_skill_events(conn, events):
+    conn.executemany("""
+        INSERT OR IGNORE INTO skill_events
+            (uuid, session_id, timestamp, kind, skill, source, load_chars)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, [(e["uuid"], e["session_id"], e["timestamp"], e["kind"],
+           e["skill"], e["source"], e["load_chars"]) for e in events])
+
+
+def _backfill_skill_events(conn):
+    """One-time skill-event backfill for transcripts already in processed_files
+    (an incremental scan would never revisit them). Gated in scan()."""
+    paths = [r["path"] for r in conn.execute("SELECT path FROM processed_files")]
+    for path in paths:
+        if os.path.exists(path):
+            insert_skill_events(conn, parse_skill_events(path))
+    conn.commit()
 
 
 def project_name_from_cwd(cwd):
@@ -606,6 +722,13 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         if verbose and filled:
             print(f"Backfilled topic for {filled} existing session(s).")
 
+    # Same idea for project-skill events (added after topics): fill them in for
+    # transcripts that were processed before the skill_events table existed.
+    if _meta_get(conn, "skill_backfill_done") != "1":
+        _backfill_skill_events(conn)
+        _meta_set(conn, "skill_backfill_done", "1")
+        conn.commit()
+
     new_files = 0
     updated_files = 0
     skipped_files = 0
@@ -636,6 +759,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             # New file: full parse (single read, returns line count)
             session_metas, turns, agents, line_count = parse_jsonl_file(filepath)
             upsert_agents(conn, agents)
+            insert_skill_events(conn, parse_skill_events(filepath))
 
             if turns or session_metas:
                 sessions = aggregate_sessions(session_metas, turns)
@@ -777,6 +901,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
             new_turns = turns_no_id + list(seen_messages.values())
             upsert_agents(conn, list(agents.values()))
+            insert_skill_events(conn, parse_skill_events(filepath, skip_lines=old_lines))
 
             if new_turns or new_session_metas:
                 sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)

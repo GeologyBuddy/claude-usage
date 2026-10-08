@@ -60,13 +60,15 @@ A conditional unique index on `turns.message_id` (where non-empty) lets `INSERT 
 
 ### Non-obvious invariants
 
-These three things will bite you if you don't know them:
+These four things will bite you if you don't know them:
 
 1. **Streaming dedupe by `message.id`.** Claude Code writes multiple JSONL records per API response — only the *last* one for a given `message.id` has the final usage tallies. `parse_jsonl_file` keeps the last record per `message_id` in a dict; earlier records are discarded. Don't sum across records of the same `message_id`.
 
 2. **Session totals are recomputed from `turns` at the end of `scan()`.** During an incremental scan `upsert_sessions` adds tokens additively, but `insert_turns` uses `INSERT OR IGNORE` against the `message_id` unique index — so if a turn is a duplicate, session totals would drift. The final `UPDATE sessions ... (SELECT SUM ... FROM turns)` block reconciles this. Preserve it if you refactor scan logic.
 
 3. **Session primary model priority is opus > sonnet > haiku** (`_model_priority` in [scanner.py](scanner.py)). This prevents a subagent's haiku turn from overwriting the session's opus model when an existing session is updated. Per-turn model is always honored in the `turns` table; only the session-level summary uses the priority.
+
+4. **Skill tokens are attributed by window, not measured.** A skill has no usage of its own. It injects SKILL.md into the main thread as an `isMeta` user record that starts with `Base directory for this skill:` (the record has `sourceToolUseID` when the model started the skill, and none when the user typed `/skill-name`). `skill_events` stores project-skill loads and real user prompts. `get_dashboard_data` gives a run the main-thread turns after the load, up to the session's next event, so no turn is counted twice. "Project skill" means the base dir is not under `~/.claude` or `~/.agents`. Transcripts scanned before `skill_events` existed are backfilled once, gated by `schema_meta.skill_backfill_done`.
 
 ### Cost calculation
 

@@ -219,6 +219,62 @@ def get_dashboard_data(db_path=DB_PATH):
         "status":         r["status"],
     } for r in top_dispatch_rows]
 
+    # ── Project-skill runs (one row per run × model) ──────────────────────────
+    # A skill has no token counter of its own: it injects SKILL.md into the main
+    # thread. Attribute to a run the main-thread turns after its load, up to the
+    # session's next event (a real user prompt or another skill load), so no
+    # turn is counted twice. Cost stays per turn-model row, priced client-side.
+    skill_rows = conn.execute("""
+        WITH runs AS (
+            SELECT e.uuid, e.session_id, e.skill, e.source, e.load_chars,
+                   e.timestamp AS start_ts,
+                   (SELECT MIN(n.timestamp) FROM skill_events n
+                     WHERE n.session_id = e.session_id
+                       AND n.timestamp > e.timestamp) AS stop_ts
+            FROM skill_events e
+            WHERE e.kind = 'skill'
+        )
+        SELECT
+            r.uuid, r.skill, r.source, r.load_chars, r.start_ts,
+            COALESCE(NULLIF(t.model, ''), 'unknown') as model,
+            COUNT(t.session_id)                      as turns,
+            SUM(t.input_tokens)                      as input,
+            SUM(t.output_tokens)                     as output,
+            SUM(t.cache_read_tokens)                 as cache_read,
+            SUM(t.cache_creation_tokens)             as cache_creation,
+            MAX(t.timestamp)                         as last_ts
+        FROM runs r
+        LEFT JOIN turns t
+            ON t.session_id = r.session_id AND t.is_subagent = 0
+           AND t.timestamp > r.start_ts
+           AND (r.stop_ts IS NULL OR t.timestamp < r.stop_ts)
+        GROUP BY r.uuid, COALESCE(NULLIF(t.model, ''), 'unknown')
+        ORDER BY r.start_ts
+    """).fetchall()
+
+    skill_runs = []
+    for r in skill_rows:
+        try:
+            t1 = datetime.fromisoformat(r["start_ts"].replace("Z", "+00:00"))
+            t2 = datetime.fromisoformat(r["last_ts"].replace("Z", "+00:00"))
+            duration_ms = max(0, int((t2 - t1).total_seconds() * 1000))
+        except Exception:
+            duration_ms = 0
+        skill_runs.append({
+            "run_id":         r["uuid"],
+            "skill":          r["skill"],
+            "source":         r["source"],
+            "day":            (r["start_ts"] or "")[:10],
+            "load_tokens":    (r["load_chars"] or 0) // 4,
+            "model":          r["model"],
+            "turns":          r["turns"] or 0,
+            "input":          r["input"] or 0,
+            "output":         r["output"] or 0,
+            "cache_read":     r["cache_read"] or 0,
+            "cache_creation": r["cache_creation"] or 0,
+            "duration_ms":    duration_ms,
+        })
+
     conn.close()
 
     return {
@@ -228,6 +284,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "sessions_all":    sessions_all,
         "subagent_by_type": subagent_by_type,
         "top_dispatches":  top_dispatches,
+        "skill_runs":      skill_runs,
         "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -489,6 +546,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button class="jump-link" data-target="sec-models">By Model</button>
       <button class="jump-link" data-target="sec-projects">Top Projects</button>
       <button class="jump-link" data-target="sec-subagents">Subagents</button>
+      <button class="jump-link" data-target="sec-skills">Skills</button>
     </div>
   </div>
   <div class="jump-menu jump-menu-end">
@@ -499,6 +557,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="jump-panel">
       <button class="jump-link" data-target="sec-cost-model">Cost by Model</button>
       <button class="jump-link" data-target="sec-dispatches">Dispatches</button>
+      <button class="jump-link" data-target="sec-skill-table">Project Skills</button>
       <button class="jump-link" data-target="sec-sessions">Sessions</button>
       <button class="jump-link" data-target="sec-cost-project">Cost by Project</button>
       <button class="jump-link" data-target="sec-cost-branch">Cost by Project &amp; Branch</button>
@@ -539,6 +598,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2><span class="card-caret">&#9656;</span><span id="subagent-chart-title">Subagent Tokens by Type</span></h2>
       <div class="chart-wrap"><canvas id="chart-subagent"></canvas></div>
     </div>
+    <div class="chart-card wide" id="sec-skills" data-card="skill-chart">
+      <h2><span class="card-caret">&#9656;</span><span id="skill-chart-title">Project Skill Tokens by Skill</span></h2>
+      <div class="chart-wrap"><canvas id="chart-skill"></canvas></div>
+    </div>
   </div>
   <div class="table-card" id="sec-cost-model" data-card="cost-by-model">
     <div class="section-title"><span class="card-caret">&#9656;</span>Cost by Model</div>
@@ -566,6 +629,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tbody id="dispatches-body"></tbody>
     </table>
     <div class="table-foot" id="dispatches-foot"></div>
+  </div>
+  <div class="table-card" id="sec-skill-table" data-card="skills">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Project Skills <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="Project skills only (.claude/skills or .agents/skills in the project), started by the model (auto) or typed as /skill-name (user). Tokens = main-thread turns after the skill loads, up to the next user prompt or skill load (an estimate, not an exact attribution; subagents are counted in their own section). Load tok = SKILL.md text size / 4."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportSkillsCSV()" title="Export filtered project-skill totals to CSV">&#x2913; CSV</button></div>
+    <table>
+      <thead><tr>
+        <th>Skill</th><th>Uses</th><th>Auto / User</th><th>Turns</th><th>Duration</th><th>Load Tok</th>
+        <th>Input</th><th>Output</th><th>Cache Read</th><th>Cache Creation</th><th>Tokens</th><th>Est. Cost</th>
+      </tr></thead>
+      <tbody id="skills-body"></tbody>
+    </table>
   </div>
   <div class="table-card" id="sec-sessions" data-card="sessions">
     <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
@@ -868,7 +941,8 @@ Chart.defaults.plugins.tooltip.callbacks.labelColor = (ctx) => {
 // series the user toggled off. We track hidden series by label per chart and
 // reapply on rebuild: dataset charts via `dataset.hidden`, the doughnut via
 // per-slice data visibility (see applyModelHidden).
-const hiddenSeries = { daily: new Set(), hourly: new Set(), project: new Set(), model: new Set(), subagent: new Set() };
+const hiddenSeries = { daily: new Set(), hourly: new Set(), project: new Set(), model: new Set(), subagent: new Set(), skill: new Set() };
+let lastBySkill = [];
 function legendToggle(key) {
   return (e, item, legend) => {
     const ci = legend.chart;
@@ -1287,10 +1361,14 @@ function applyFilter() {
     selectedModels.has(d.model) && (!start || d.start_date >= start) && (!end || d.start_date <= end)
   );
 
+  const bySkill = aggregateSkills(rawData.skill_runs || [], start, end);
+
   // Update daily chart title
   document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
   document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
   document.getElementById('subagent-chart-title').textContent = 'Subagent Tokens by Type \u2014 ' + RANGE_LABELS[selectedRange];
+
+  document.getElementById('skill-chart-title').textContent = 'Project Skill Tokens by Skill \u2014 ' + RANGE_LABELS[selectedRange];
 
   renderStats(totals);
   renderDailyChart(daily);
@@ -1298,6 +1376,9 @@ function applyFilter() {
   renderModelChart(byModel);
   renderProjectChart(byProject);
   renderSubagentChart(byAgentType);
+  lastBySkill = bySkill;
+  renderSkillChart(bySkill);
+  renderSkillsTable(bySkill);
   lastFilteredDispatches = filteredDispatches;
   renderTopDispatches(lastFilteredDispatches);
   lastFilteredSessions = sortSessions(filteredSessions);
@@ -1570,6 +1651,92 @@ function renderSubagentChart(byType) {
       }
     }
   });
+}
+
+// Roll per-(run × model) rows up to one row per skill. A run counts as a use if
+// it started in range, whatever its turns' models; tokens and cost only come
+// from selected models, priced per row so multi-model runs are costed correctly.
+// Load size and duration are per run, so each run counts them once.
+function aggregateSkills(rows, start, end) {
+  const map = {}, seen = new Set();
+  for (const r of rows) {
+    if ((start && r.day < start) || (end && r.day > end)) continue;
+    if (!map[r.skill]) map[r.skill] = { skill: r.skill, uses: 0, auto: 0, user: 0, turns: 0, load_tokens: 0,
+                                        input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0, runDur: {} };
+    const m = map[r.skill];
+    if (!seen.has(r.run_id)) {
+      seen.add(r.run_id);
+      m.uses++; m[r.source === 'user' ? 'user' : 'auto']++;
+      m.load_tokens += r.load_tokens;
+    }
+    m.runDur[r.run_id] = Math.max(m.runDur[r.run_id] || 0, r.duration_ms);
+    if (!selectedModels.has(r.model)) continue;
+    m.turns += r.turns;
+    m.input += r.input; m.output += r.output;
+    m.cache_read += r.cache_read; m.cache_creation += r.cache_creation;
+    m.cost += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+  }
+  return Object.values(map).map(({ runDur, ...m }) => ({
+    ...m,
+    duration_ms: Object.values(runDur).reduce((s, d) => s + d, 0),
+    tokens: m.input + m.output + m.cache_read + m.cache_creation,
+  })).sort((a, b) => b.tokens - a.tokens || b.uses - a.uses);
+}
+
+function renderSkillChart(bySkill) {
+  const ctx = document.getElementById('chart-skill').getContext('2d');
+  if (charts.skill) charts.skill.destroy();
+  if (!bySkill.length) { charts.skill = null; return; }
+  const series = [['Input', 'input'], ['Output', 'output'], ['Cache Read', 'cache_read'], ['Cache Creation', 'cache_creation']];
+  charts.skill = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: bySkill.map(s => s.skill),
+      datasets: series.map(([label, key]) => ({
+        label, hidden: hiddenSeries.skill.has(label), data: bySkill.map(s => s[key]),
+        backgroundColor: TOKEN_COLORS[key], hoverBackgroundColor: TOKEN_HOVER[key], stack: 'tokens',
+      })),
+    },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false, resizeDelay: 150,
+      plugins: {
+        legend: { onClick: legendToggle('skill'), labels: { color: C.axis, boxWidth: 12 } },
+        tooltip: { callbacks: {
+          label: ctx => ` ${ctx.dataset.label}: ${fmt(ctx.raw)}`,
+          footer: items => {
+            const row = bySkill[items[0].dataIndex];
+            return ` Total: ${fmt(row.tokens)} · ${row.uses} uses · ${row.turns} turns`;
+          }
+        } }
+      },
+      scales: {
+        x: { stacked: true, ticks: { color: C.axis, callback: v => fmt(v) }, grid: { color: C.border } },
+        y: { stacked: true, ticks: { color: C.axis, font: { size: 11 } }, grid: { color: C.border } },
+      }
+    }
+  });
+}
+
+function renderSkillsTable(bySkill) {
+  const body = document.getElementById('skills-body');
+  if (!bySkill.length) {
+    body.innerHTML = '<tr><td colspan="12" class="muted" style="text-align:center;padding:24px">No project skill runs in selected range.</td></tr>';
+    return;
+  }
+  body.innerHTML = bySkill.map(s => `<tr>
+      <td><span class="model-tag">${esc(s.skill)}</span></td>
+      <td class="num">${s.uses}</td>
+      <td class="num muted">${s.auto} / ${s.user}</td>
+      <td class="num">${s.turns}</td>
+      <td class="muted">${fmtDuration(s.duration_ms)}</td>
+      <td class="num muted">~${fmt(s.load_tokens)}</td>
+      <td class="num">${fmt(s.input)}</td>
+      <td class="num">${fmt(s.output)}</td>
+      <td class="num">${fmt(s.cache_read)}</td>
+      <td class="num">${fmt(s.cache_creation)}</td>
+      <td class="num"><strong>${fmt(s.tokens)}</strong></td>
+      <td class="cost">${fmtCost(s.cost)}</td>
+    </tr>`).join('');
 }
 
 function renderTopDispatches(rows) {
@@ -1897,6 +2064,13 @@ function exportDispatchesCSV() {
             d.input, d.output, d.cache_read, d.cache_creation, total, cost.toFixed(4), d.status || ''];
   });
   downloadCSV('subagent_dispatches', header, rows);
+}
+
+function exportSkillsCSV() {
+  const header = ['Skill', 'Uses', 'Auto', 'User', 'Turns', 'Duration (ms)', 'Load Tokens (est.)', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Total Tokens', 'Est. Cost'];
+  const rows = lastBySkill.map(s => [s.skill, s.uses, s.auto, s.user, s.turns, s.duration_ms, s.load_tokens,
+    s.input, s.output, s.cache_read, s.cache_creation, s.tokens, s.cost.toFixed(4)]);
+  downloadCSV('project_skills', header, rows);
 }
 
 // ── Rescan ────────────────────────────────────────────────────────────────
