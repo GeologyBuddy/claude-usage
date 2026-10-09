@@ -5,6 +5,7 @@
 ### Dashboard
 
 - Added a **Project Skills** section: a token chart and a table per project skill (from the project's `.claude/skills/` or `.agents/skills/`) with Uses, Auto / User split, Turns, Duration, estimated load tokens, Input, Output, Cache Read, Cache Creation, total Tokens, and Est. Cost, plus CSV export. A run's tokens are the main-thread turns after the skill loads, up to the next user prompt or skill load. User-level, plugin, and built-in commands are excluded.
+- Made **Recent Sessions** rows expandable: click a row (or press Enter on it) to see the project skills used in that session, with the same per-skill usage columns.
 
 ### Scanner
 

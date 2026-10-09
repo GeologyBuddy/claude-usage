@@ -235,7 +235,7 @@ def get_dashboard_data(db_path=DB_PATH):
             WHERE e.kind = 'skill'
         )
         SELECT
-            r.uuid, r.skill, r.source, r.load_chars, r.start_ts,
+            r.uuid, r.session_id, r.skill, r.source, r.load_chars, r.start_ts,
             COALESCE(NULLIF(t.model, ''), 'unknown') as model,
             COUNT(t.session_id)                      as turns,
             SUM(t.input_tokens)                      as input,
@@ -262,6 +262,7 @@ def get_dashboard_data(db_path=DB_PATH):
             duration_ms = 0
         skill_runs.append({
             "run_id":         r["uuid"],
+            "session_id":     r["session_id"],
             "skill":          r["skill"],
             "source":         r["source"],
             "day":            (r["start_ts"] or "")[:10],
@@ -413,6 +414,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: var(--raised); }
+  .session-row { cursor: pointer; }
+  .session-row.open td { background: var(--raised); }
+  .session-row:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+  .row-caret { display: inline-block; width: 12px; font-size: 10px; color: var(--muted); }
+  .session-detail > td { background: var(--bg); padding: 8px 12px 14px 36px; }
+  .session-detail:hover > td { background: var(--bg); }
+  .session-skills th, .session-skills td { padding: 6px 10px; font-size: 12px; }
+  .session-detail-empty { padding: 6px 0; font-size: 12px; }
   .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(72,160,199,0.15); color: var(--blue); }
   .cost { color: var(--green); font-family: monospace; }
   .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
@@ -728,6 +737,7 @@ let projectSortDir = 'desc';
 let branchSortCol = 'cost';
 let branchSortDir = 'desc';
 let lastFilteredSessions = [];
+let openSession = null;  // session_id whose project-skill detail row is open
 let lastByModel = [];
 let lastByProject = [];
 let lastByProjectBranch = [];
@@ -1657,10 +1667,11 @@ function renderSubagentChart(byType) {
 // it started in range, whatever its turns' models; tokens and cost only come
 // from selected models, priced per row so multi-model runs are costed correctly.
 // Load size and duration are per run, so each run counts them once.
-function aggregateSkills(rows, start, end) {
+function aggregateSkills(rows, start, end, sessionId) {
   const map = {}, seen = new Set();
   for (const r of rows) {
     if ((start && r.day < start) || (end && r.day > end)) continue;
+    if (sessionId && r.session_id !== sessionId) continue;
     if (!map[r.skill]) map[r.skill] = { skill: r.skill, uses: 0, auto: 0, user: 0, turns: 0, load_tokens: 0,
                                         input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0, runDur: {} };
     const m = map[r.skill];
@@ -1723,7 +1734,14 @@ function renderSkillsTable(bySkill) {
     body.innerHTML = '<tr><td colspan="12" class="muted" style="text-align:center;padding:24px">No project skill runs in selected range.</td></tr>';
     return;
   }
-  body.innerHTML = bySkill.map(s => `<tr>
+  body.innerHTML = bySkill.map(skillRowHtml).join('');
+}
+
+const SKILL_HEADERS = ['Skill', 'Uses', 'Auto / User', 'Turns', 'Duration', 'Load Tok',
+                       'Input', 'Output', 'Cache Read', 'Cache Creation', 'Tokens', 'Est. Cost'];
+
+function skillRowHtml(s) {
+  return `<tr>
       <td><span class="model-tag">${esc(s.skill)}</span></td>
       <td class="num">${s.uses}</td>
       <td class="num muted">${s.auto} / ${s.user}</td>
@@ -1736,7 +1754,24 @@ function renderSkillsTable(bySkill) {
       <td class="num">${fmt(s.cache_creation)}</td>
       <td class="num"><strong>${fmt(s.tokens)}</strong></td>
       <td class="cost">${fmtCost(s.cost)}</td>
-    </tr>`).join('');
+    </tr>`;
+}
+
+// Inner table for an opened Recent Sessions row: that session's project skills.
+// No date cut (the session is already in range); the model filter still applies.
+function renderSessionSkills(sessionId) {
+  const bySkill = aggregateSkills(rawData.skill_runs || [], null, null, sessionId);
+  if (!bySkill.length) return '<div class="muted session-detail-empty">No project skills ran in this session.</div>';
+  return `<table class="session-skills"><thead><tr>${SKILL_HEADERS.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+    <tbody>${bySkill.map(skillRowHtml).join('')}</tbody></table>`;
+}
+
+function toggleSession(e) {
+  const row = e.target.closest('tr.session-row');
+  if (!row || (e.type === 'keydown' && e.key !== 'Enter')) return;
+  openSession = openSession === row.dataset.sid ? null : row.dataset.sid;
+  renderSessionsTable(lastFilteredSessions);
+  document.querySelector(`#sessions-body tr.session-row[data-sid="${CSS.escape(row.dataset.sid)}"]`)?.focus();
 }
 
 function renderTopDispatches(rows) {
@@ -1819,6 +1854,7 @@ function lessDispatchRows(){ dispatchesLimit = TABLE_STEPS[0]; renderTopDispatch
 
 function renderSessionsTable(sessions) {
   const shown = sessions.slice(0, shownCount(sessionsLimit, sessions.length));
+  if (!shown.some(s => s.session_id === openSession)) openSession = null;
   document.getElementById('sessions-body').innerHTML = shown.map(s => {
     const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
     const costCell = isBillable(s.model)
@@ -1827,8 +1863,12 @@ function renderSessionsTable(sessions) {
     const titleCell = s.topic
       ? `<td class="topic-cell" title="${esc(s.topic)}">${esc(s.topic)}</td>`
       : `<td class="topic-cell"><span class="untitled">Untitled</span></td>`;
-    return `<tr>
-      <td class="muted" style="font-family:monospace">${esc(s.session_id.slice(0, 8))}&hellip;</td>
+    const open = s.session_id === openSession;
+    const detail = open
+      ? `<tr class="session-detail"><td colspan="10">${renderSessionSkills(s.session_id)}</td></tr>`
+      : '';
+    return `<tr class="session-row${open ? ' open' : ''}" data-sid="${esc(s.session_id)}" tabindex="0" aria-expanded="${open}" title="Show project skills used in this session">
+      <td class="muted" style="font-family:monospace"><span class="row-caret">${open ? '&#9662;' : '&#9656;'}</span>${esc(s.session_id.slice(0, 8))}&hellip;</td>
       <td>${esc(s.project)}</td>
       ${titleCell}
       <td class="muted">${esc(s.last)}</td>
@@ -1838,7 +1878,7 @@ function renderSessionsTable(sessions) {
       <td class="num">${fmt(s.input)}</td>
       <td class="num">${fmt(s.output)}</td>
       ${costCell}
-    </tr>`;
+    </tr>${detail}`;
   }).join('');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
 }
@@ -2356,6 +2396,9 @@ function initSectionNav() {
 
 initFooterMeta();
 initSectionNav();
+const sessionsBody = document.getElementById('sessions-body');
+sessionsBody.addEventListener('click', toggleSession);
+sessionsBody.addEventListener('keydown', toggleSession);
 loadData();
 scheduleAutoRefresh();
 </script>

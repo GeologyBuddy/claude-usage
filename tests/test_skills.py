@@ -116,6 +116,7 @@ class TestSkillRunsEndToEnd(unittest.TestCase):
         self.assertEqual((a["turns"], a["input"], a["output"]), (1, 300, 30))
         self.assertEqual(p["duration_ms"], 10000)   # 10:00:02 -> 10:00:12
         self.assertEqual(p["source"], "auto")
+        self.assertEqual(p["session_id"], "s1")
         self.assertGreater(p["load_tokens"], 0)
 
     def test_incremental_rescan_does_not_duplicate_events(self):
