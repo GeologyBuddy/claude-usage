@@ -4,10 +4,12 @@ scanner.py - Scans Claude Code JSONL transcript files and stores data in SQLite.
 
 import json
 import os
+import sys
 import glob
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import unquote, urlparse
 
 # Single source of truth for the app version reported by the CLI (`--version`)
 # and the dashboard footer. CHANGELOG.md is the canonical version reference, but
@@ -113,6 +115,22 @@ def init_db(conn):
         );
         CREATE INDEX IF NOT EXISTS idx_skill_events_session
             ON skill_events(session_id, timestamp);
+
+        -- One row per GitHub Copilot Chat request (see scan_copilot).
+        CREATE TABLE IF NOT EXISTS copilot_requests (
+            request_id    TEXT PRIMARY KEY,
+            session_id    TEXT,
+            workspace     TEXT,
+            title         TEXT,
+            timestamp     TEXT,
+            model         TEXT,
+            prompt_tokens INTEGER,
+            output_tokens INTEGER,
+            credits       REAL,
+            elapsed_ms    INTEGER,
+            rounds        INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_copilot_session ON copilot_requests(session_id);
 
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
@@ -391,22 +409,67 @@ def extract_agent_dispatch(record):
         return None
     agent_id = tur.get("agentId")
     agent_type = tur.get("agentType")
-    if not agent_id or not agent_type:
+    is_async = bool(tur.get("isAsync"))
+    # A background (async) launch has no agentType and no stats yet; its type
+    # comes from the subagent's .meta.json (see _agents_from_meta).
+    if not agent_id or not (agent_type or is_async):
         return None
     return {
         "agent_id": agent_id,
         "agent_type": agent_type,
         "dispatched_in_session": record.get("sessionId"),
         "completed_at": record.get("timestamp", ""),
-        "status": tur.get("status"),
+        "status": None if is_async else tur.get("status"),
         "total_tokens": tur.get("totalTokens"),
         "total_duration_ms": tur.get("totalDurationMs"),
         "tool_use_count": tur.get("totalToolUseCount"),
     }
 
 
+def _agents_from_meta(jsonl_files):
+    """Agent types from subagents/agent-<id>.meta.json files.
+
+    Background agents launch with no agentType on the parent record; Claude
+    Code writes it to the meta file beside the subagent transcript instead.
+    Read on every scan (the files are tiny), so already-scanned agents get
+    their type too.
+    """
+    agents = []
+    for p in jsonl_files:
+        path = Path(p)
+        if path.parent.name != "subagents" or not path.stem.startswith("agent-"):
+            continue
+        try:
+            meta = json.loads(path.with_suffix(".meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if meta.get("agentType"):
+            agents.append({"agent_id": path.stem[len("agent-"):],
+                           "agent_type": meta["agentType"],
+                           "dispatched_in_session": path.parent.parent.name})
+    return agents
+
+
+def _fill_unknown_projects(conn):
+    """Name sessions stuck at project 'unknown' from their turns' cwd.
+
+    A session's project comes from its first record, and when that is an
+    ai-title / custom-title record (no cwd) it stays 'unknown'. Turns keep the
+    cwd, so repair from them; cheap, because only 'unknown' rows are touched.
+    """
+    rows = conn.execute("""
+        SELECT s.session_id,
+               (SELECT t.cwd FROM turns t WHERE t.session_id = s.session_id
+                  AND t.cwd != '' ORDER BY t.timestamp LIMIT 1) AS cwd
+        FROM sessions s WHERE s.project_name = 'unknown'
+    """).fetchall()
+    conn.executemany("UPDATE sessions SET project_name = ? WHERE session_id = ?",
+                     [(project_name_from_cwd(r["cwd"]), r["session_id"]) for r in rows if r["cwd"]])
+
+
 def upsert_agents(conn, agents):
-    """Insert or update agent dispatch metadata. Last write wins per agent_id."""
+    """Insert or update agent dispatch metadata. Last non-null write wins per
+    field, so a sparse record (async launch, meta file) never erases a value."""
     if not agents:
         return
     conn.executemany("""
@@ -415,13 +478,13 @@ def upsert_agents(conn, agents):
              status, total_tokens, total_duration_ms, tool_use_count)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(agent_id) DO UPDATE SET
-            agent_type            = excluded.agent_type,
-            dispatched_in_session = excluded.dispatched_in_session,
-            completed_at          = excluded.completed_at,
-            status                = excluded.status,
-            total_tokens          = excluded.total_tokens,
-            total_duration_ms     = excluded.total_duration_ms,
-            tool_use_count        = excluded.tool_use_count
+            agent_type            = COALESCE(excluded.agent_type,            agents.agent_type),
+            dispatched_in_session = COALESCE(excluded.dispatched_in_session, agents.dispatched_in_session),
+            completed_at          = COALESCE(excluded.completed_at,          agents.completed_at),
+            status                = COALESCE(excluded.status,                agents.status),
+            total_tokens          = COALESCE(excluded.total_tokens,          agents.total_tokens),
+            total_duration_ms     = COALESCE(excluded.total_duration_ms,     agents.total_duration_ms),
+            tool_use_count        = COALESCE(excluded.tool_use_count,        agents.tool_use_count)
     """, [
         (a["agent_id"], a["agent_type"], a.get("dispatched_in_session"),
          a.get("completed_at"), a.get("status"),
@@ -689,7 +752,151 @@ def insert_turns(conn, turns):
     ])
 
 
-def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
+# ── GitHub Copilot Chat (VS Code) ───────────────────────────────────────────
+# VS Code saves each Copilot chat as a JSONL change log in
+# <User>/workspaceStorage/<hash>/chatSessions/ (or globalStorage/
+# emptyWindowChatSessions/ when no folder is open). Line 1 (kind 0) is a full
+# snapshot; later lines patch it: kind 1 sets the value at path k, kind 2
+# appends v to the array at k (after cutting it to index i, when given).
+# Token meaning, checked against real logs: completionTokens is the total over
+# all tool-call rounds of a request; promptTokens is one call's prompt (the
+# context size), not a sum. copilotCredits is the unit Copilot bills.
+
+def _vscode_user_dirs():
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return [base / name / "User" for name in ("Code", "Code - Insiders", "VSCodium")]
+
+
+# Read at call time (not frozen as a default arg) so tests can patch it.
+COPILOT_DIRS = _vscode_user_dirs()
+
+
+def replay_copilot_chat(filepath):
+    """Apply a chat's change log and return the final chat state (a dict)."""
+    state = {}
+    with open(filepath, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            kind, path, value = rec.get("kind"), rec.get("k") or [], rec.get("v")
+            if kind == 0:
+                state = value
+                continue
+            target = state
+            for key in path[:-1]:
+                target = target[key]
+            if kind == 1:
+                target[path[-1]] = value
+            elif kind == 2:
+                arr = target[path[-1]]
+                if "i" in rec:
+                    del arr[rec["i"]:]
+                arr.extend(value)
+    return state
+
+
+def _copilot_workspace(chat_file):
+    """Friendly name of the folder a chat belongs to, from workspace.json."""
+    ws_json = Path(chat_file).parent.parent / "workspace.json"
+    try:
+        info = json.loads(ws_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "(no folder)"
+    uri = info.get("folder") or info.get("workspace") or ""
+    path = unquote(urlparse(uri).path)
+    if len(path) > 2 and path[0] == "/" and path[2] == ":":  # /c:/Users/... on Windows
+        path = path[1:]
+    return project_name_from_cwd(path)
+
+
+def _ms_to_iso(ms):
+    """Epoch ms -> the same ISO-8601 UTC form Claude Code uses (…T..:..:..mmmZ)."""
+    dt = datetime.fromtimestamp(ms / 1000, timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(ms) % 1000:03d}Z"
+
+
+def parse_copilot_chat(filepath):
+    """Return (session_id, request rows) for one Copilot chat file."""
+    state = replay_copilot_chat(filepath)
+    session_id = state.get("sessionId") or Path(filepath).stem
+    requests = state.get("requests") or []
+    questions = [((q.get("message") or {}).get("text") or "").strip() for q in requests]
+    title = state.get("customTitle") or next((t for t in questions if t), "")[:80]
+    workspace = _copilot_workspace(filepath)
+    rows = []
+    for q in requests:
+        prompt, output, credits = q.get("promptTokens"), q.get("completionTokens"), q.get("copilotCredits")
+        if (prompt is None and output is None and credits is None) or not q.get("timestamp"):
+            continue  # cancelled before the model answered
+        meta = (q.get("result") or {}).get("metadata") or {}
+        model = meta.get("resolvedModel") or q.get("modelId") or "unknown"
+        if model.startswith("copilot/"):
+            model = model[len("copilot/"):]
+        rows.append({
+            "request_id": q.get("requestId") or f"{session_id}:{q['timestamp']}",
+            "session_id": session_id, "workspace": workspace, "title": title,
+            "timestamp": _ms_to_iso(q["timestamp"]), "model": model,
+            "prompt_tokens": prompt or 0, "output_tokens": output or 0,
+            "credits": credits or 0.0, "elapsed_ms": q.get("elapsedMs") or 0,
+            "rounds": len(meta.get("toolCallRounds") or []),
+        })
+    return session_id, rows
+
+
+def _copilot_chat_files(user_dirs):
+    files = []
+    for d in map(Path, user_dirs):
+        files += glob.glob(str(d / "workspaceStorage" / "*" / "chatSessions" / "*.jsonl"))
+        files += glob.glob(str(d / "globalStorage" / "emptyWindowChatSessions" / "*.jsonl"))
+    return sorted(files)
+
+
+def scan_copilot(conn, user_dirs, verbose=False):
+    """Ingest new or changed Copilot chat files. Returns the number of files read.
+
+    A changed chat is re-read whole (the files are small) and its rows are
+    replaced, so edits and undone requests are reflected. Rows of chats whose
+    file is gone are kept, like Claude history after transcript pruning.
+    """
+    read = 0
+    for filepath in _copilot_chat_files(user_dirs):
+        try:
+            mtime = os.path.getmtime(filepath)
+        except OSError:
+            continue
+        row = conn.execute("SELECT mtime FROM processed_files WHERE path = ?", (filepath,)).fetchone()
+        if row and abs(row["mtime"] - mtime) < 0.01:
+            continue
+        try:
+            session_id, rows = parse_copilot_chat(filepath)
+        except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+            if verbose:
+                print(f"  Warning: skipped Copilot chat {filepath}: {e}")
+            continue
+        conn.execute("DELETE FROM copilot_requests WHERE session_id = ?", (session_id,))
+        conn.executemany("""
+            INSERT OR REPLACE INTO copilot_requests
+                (request_id, session_id, workspace, title, timestamp, model,
+                 prompt_tokens, output_tokens, credits, elapsed_ms, rounds)
+            VALUES (:request_id, :session_id, :workspace, :title, :timestamp, :model,
+                    :prompt_tokens, :output_tokens, :credits, :elapsed_ms, :rounds)
+        """, rows)
+        conn.execute("INSERT OR REPLACE INTO processed_files (path, mtime, lines) VALUES (?, ?, 0)",
+                     (filepath, mtime))
+        conn.commit()
+        read += 1
+        if verbose:
+            print(f"  [COPILOT] {filepath} ({len(rows)} requests)")
+    return read
+
+
+def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True, copilot_dirs=None):
     conn = get_db(db_path)
     init_db(conn)
 
@@ -933,6 +1140,16 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         """)
         conn.commit()
 
+    upsert_agents(conn, _agents_from_meta(jsonl_files))
+    _fill_unknown_projects(conn)
+    conn.commit()
+
+    # Copilot chats: on by default, off when the caller points the scan at a
+    # custom transcripts dir (tests, --projects-dir) unless it passes dirs too.
+    if copilot_dirs is None:
+        copilot_dirs = COPILOT_DIRS if projects_dir is None and projects_dirs is None else []
+    copilot_files = scan_copilot(conn, copilot_dirs, verbose)
+
     if verbose:
         print(f"\nScan complete:")
         print(f"  New files:     {new_files}")
@@ -940,10 +1157,11 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         print(f"  Skipped files: {skipped_files}")
         print(f"  Turns added:   {total_turns}")
         print(f"  Sessions seen: {len(total_sessions)}")
+        print(f"  Copilot chats: {copilot_files} read")
 
     conn.close()
     return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
-            "turns": total_turns, "sessions": len(total_sessions)}
+            "turns": total_turns, "sessions": len(total_sessions), "copilot": copilot_files}
 
 
 if __name__ == "__main__":

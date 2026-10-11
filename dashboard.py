@@ -24,6 +24,16 @@ DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usag
 SURFACE = "web"
 
 
+def _span_ms(start_ts, end_ts):
+    """Milliseconds between two ISO timestamps, or None if either is missing."""
+    try:
+        t1 = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+        t2 = datetime.fromisoformat(end_ts.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    return max(0, int((t2 - t1).total_seconds() * 1000))
+
+
 def get_dashboard_data(db_path=DB_PATH):
     if not db_path.exists():
         return {"error": "Database not found. Run: python cli.py scan"}
@@ -183,9 +193,11 @@ def get_dashboard_data(db_path=DB_PATH):
     top_dispatch_rows = conn.execute(f"""
         SELECT
             t.agent_id                               as agent_id,
+            MIN(t.session_id)                        as session_id,
             {AGENT_TYPE_EXPR}                        as agent_type,
             COALESCE(NULLIF(t.model, ''), 'unknown') as model,
             MIN(t.timestamp)                         as start_ts,
+            MAX(t.timestamp)                         as end_ts,
             SUM(t.input_tokens)                      as input,
             SUM(t.output_tokens)                     as output,
             SUM(t.cache_read_tokens)                 as cache_read,
@@ -205,6 +217,7 @@ def get_dashboard_data(db_path=DB_PATH):
 
     top_dispatches = [{
         "agent_id":       r["agent_id"],
+        "session_id":     r["session_id"],
         "agent_type":     r["agent_type"],
         "model":          r["model"],
         "start":          (r["start_ts"] or "")[:16].replace("T", " "),
@@ -214,7 +227,9 @@ def get_dashboard_data(db_path=DB_PATH):
         "cache_read":     r["cache_read"] or 0,
         "cache_creation": r["cache_creation"] or 0,
         "turns":          r["turns"] or 0,
-        "duration_ms":    r["duration_ms"],
+        # Background agents report no duration: fall back to first..last turn.
+        "duration_ms":    r["duration_ms"] if r["duration_ms"] is not None
+                          else _span_ms(r["start_ts"], r["end_ts"]),
         "tool_uses":      r["tool_uses"],
         "status":         r["status"],
     } for r in top_dispatch_rows]
@@ -254,12 +269,7 @@ def get_dashboard_data(db_path=DB_PATH):
 
     skill_runs = []
     for r in skill_rows:
-        try:
-            t1 = datetime.fromisoformat(r["start_ts"].replace("Z", "+00:00"))
-            t2 = datetime.fromisoformat(r["last_ts"].replace("Z", "+00:00"))
-            duration_ms = max(0, int((t2 - t1).total_seconds() * 1000))
-        except Exception:
-            duration_ms = 0
+        duration_ms = _span_ms(r["start_ts"], r["last_ts"]) or 0
         skill_runs.append({
             "run_id":         r["uuid"],
             "session_id":     r["session_id"],
@@ -276,6 +286,14 @@ def get_dashboard_data(db_path=DB_PATH):
             "duration_ms":    duration_ms,
         })
 
+    # ── GitHub Copilot Chat requests (raw rows; the client filters by range) ──
+    copilot_requests = [{
+        "session_id": r["session_id"], "workspace": r["workspace"], "title": r["title"],
+        "ts":         r["timestamp"], "day": r["timestamp"][:10], "model": r["model"],
+        "prompt":     r["prompt_tokens"], "output": r["output_tokens"],
+        "credits":    r["credits"], "elapsed_ms": r["elapsed_ms"], "rounds": r["rounds"],
+    } for r in conn.execute("SELECT * FROM copilot_requests ORDER BY timestamp")]
+
     conn.close()
 
     return {
@@ -286,6 +304,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "subagent_by_type": subagent_by_type,
         "top_dispatches":  top_dispatches,
         "skill_runs":      skill_runs,
+        "copilot_requests": copilot_requests,
         "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -422,6 +441,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .session-detail:hover > td { background: var(--bg); }
   .session-skills th, .session-skills td { padding: 6px 10px; font-size: 12px; }
   .session-detail-empty { padding: 6px 0; font-size: 12px; }
+  .detail-title { font-size: 10px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 10px 0 2px; }
+  .detail-title:first-child { margin-top: 2px; }
+  .copilot-only[hidden] { display: none; }
+  .sub-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 18px 0 6px; }
+  .sub-title .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .kpi-chip { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+  .kpi-chip b { color: var(--text); font-weight: 600; font-family: monospace; }
+  .credits { color: var(--blue); font-family: monospace; }
   .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(72,160,199,0.15); color: var(--blue); }
   .cost { color: var(--green); font-family: monospace; }
   .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
@@ -434,6 +461,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .section-header .section-title { margin-bottom: 0; }
   .export-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 3px 10px; border-radius: 5px; cursor: pointer; font-size: 11px; }
   .export-btn:hover { color: var(--text); border-color: var(--accent); }
+  #to-top { position: fixed; right: 24px; bottom: 24px; z-index: 50; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); padding: 9px 16px; border-radius: 999px; cursor: pointer; font-size: 13px; font-weight: 700; box-shadow: 0 6px 18px rgba(0,0,0,0.45), 0 0 0 3px rgba(217,119,87,0.18); transition: filter 0.15s, transform 0.15s; }
+  #to-top:hover, #to-top:focus-visible { filter: brightness(1.12); transform: translateY(-2px); outline: none; }
   .table-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; overflow-x: auto; }
   .table-foot { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 12px; }
   .table-foot:empty { margin-top: 0; }
@@ -556,6 +585,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button class="jump-link" data-target="sec-projects">Top Projects</button>
       <button class="jump-link" data-target="sec-subagents">Subagents</button>
       <button class="jump-link" data-target="sec-skills">Skills</button>
+      <button class="jump-link copilot-only" data-target="sec-copilot">Copilot</button>
     </div>
   </div>
   <div class="jump-menu jump-menu-end">
@@ -567,6 +597,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button class="jump-link" data-target="sec-cost-model">Cost by Model</button>
       <button class="jump-link" data-target="sec-dispatches">Dispatches</button>
       <button class="jump-link" data-target="sec-skill-table">Project Skills</button>
+      <button class="jump-link copilot-only" data-target="sec-copilot-table">Copilot Chats</button>
       <button class="jump-link" data-target="sec-sessions">Sessions</button>
       <button class="jump-link" data-target="sec-cost-project">Cost by Project</button>
       <button class="jump-link" data-target="sec-cost-branch">Cost by Project &amp; Branch</button>
@@ -611,6 +642,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2><span class="card-caret">&#9656;</span><span id="skill-chart-title">Project Skill Tokens by Skill</span></h2>
       <div class="chart-wrap"><canvas id="chart-skill"></canvas></div>
     </div>
+    <div class="chart-card wide copilot-only" id="sec-copilot" data-card="copilot-chart">
+      <div class="chart-header">
+        <h2><span class="card-caret">&#9656;</span><span id="copilot-chart-title">GitHub Copilot Credits by Day</span></h2>
+        <div class="chart-header-right" id="copilot-kpis"></div>
+      </div>
+      <div class="chart-wrap tall"><canvas id="chart-copilot"></canvas></div>
+    </div>
   </div>
   <div class="table-card" id="sec-cost-model" data-card="cost-by-model">
     <div class="section-title"><span class="card-caret">&#9656;</span>Cost by Model</div>
@@ -648,6 +686,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </tr></thead>
       <tbody id="skills-body"></tbody>
     </table>
+  </div>
+  <div class="table-card copilot-only" id="sec-copilot-table" data-card="copilot">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>GitHub Copilot Chats <span class="info-icon" tabindex="0" role="img" aria-label="About this table" title="Read from VS Code Copilot Chat logs on this computer. Credits = the copilotCredits Copilot records per request (its billing unit); 0 means free (local or included model). Prompt = the context size of a request's model call, not a sum over its tool-call rounds; Output is the total over all rounds. Follows the date range; the model filter applies to Claude only."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><button class="export-btn" onclick="exportCopilotCSV()" title="Export filtered Copilot requests to CSV">&#x2913; CSV</button></div>
+    <div class="sub-title">By model</div>
+    <table>
+      <thead><tr>
+        <th>Model</th><th>Requests</th><th>Tool Rounds</th><th>Prompt (ctx)</th><th>Output</th><th>Credits</th><th>Credits / Req</th>
+      </tr></thead>
+      <tbody id="copilot-model-body"></tbody>
+    </table>
+    <div class="sub-title">Chats <span class="muted">&middot; click a chat to see its requests</span></div>
+    <table>
+      <thead><tr>
+        <th>Chat</th><th>Workspace</th><th>Last Active</th><th>Model</th><th>Requests</th><th>Output</th><th>Credits</th>
+      </tr></thead>
+      <tbody id="copilot-chats-body"></tbody>
+    </table>
+    <div class="table-foot" id="copilot-chats-foot"></div>
   </div>
   <div class="table-card" id="sec-sessions" data-card="sessions">
     <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
@@ -703,7 +759,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of June 2026. Only models containing <em>fable</em>, <em>mythos</em>, <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
+    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of October 2026. Only models containing <em>fable</em>, <em>mythos</em>, <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
     <p>
       GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
       &nbsp;&middot;&nbsp;
@@ -714,6 +770,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <p id="footer-meta"></p>
   </div>
 </footer>
+
+<button type="button" id="to-top" hidden title="Back to top" aria-label="Back to top"
+        onclick="window.scrollTo({ top: 0, behavior: 'smooth' })">&#8593; Top</button>
 
 <script>
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -772,6 +831,7 @@ let sessionsLimit = TABLE_STEPS[0];
 let projectLimit = TABLE_STEPS[0];
 let branchLimit = TABLE_STEPS[0];
 let dispatchesLimit = TABLE_STEPS[0];
+let copilotChatsLimit = TABLE_STEPS[0];
 let hourlyTZ = 'local';  // 'local' or 'utc'
 
 // ── Peak-hour config ───────────────────────────────────────────────────────
@@ -814,8 +874,22 @@ function tzDisplayName(tzMode) {
   }
 }
 
-// ── Pricing (Anthropic API, June 2026) ─────────────────────────────────────
+// ── Pricing (Anthropic API, October 2026) ──────────────────────────────────
+// Keep in sync with cli.py PRICING. Keys are model-id prefixes; getPricing
+// picks the longest matching key. cache_write is the 5-minute rate.
 const PRICING = {
+  'claude-fable-5-1':  { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 0.25 },
+  'claude-mythos-5-1': { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 0.25 },
+  'claude-opus-5-5':   { input:  4.00, output: 20.00, cache_write:  5.00, cache_read: 0.20 },
+  'claude-opus-5':     { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
+  'claude-opus-4-1':   { input: 15.00, output: 75.00, cache_write: 18.75, cache_read: 1.50 },
+  'claude-opus-4':     { input: 15.00, output: 75.00, cache_write: 18.75, cache_read: 1.50 },
+  'claude-sonnet-5-5': { input:  2.00, output: 10.00, cache_write:  2.50, cache_read: 0.10 },
+  'claude-sonnet-5':   { input:  2.00, output: 10.00, cache_write:  2.50, cache_read: 0.20 },
+  'claude-sonnet-4':   { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
+  'claude-3-5-haiku':  { input:  0.80, output:  4.00, cache_write:  1.00, cache_read: 0.08 },
+  // Haiku 5.5: <=100K-token prompt tier (see cli.py for the >100K rates).
+  'claude-haiku-5-5':  { input:  0.10, output:  0.50, cache_write:  0.125, cache_read: 0.01 },
   // Fable / Mythos — Anthropic's most capable class, priced at 2x Opus.
   // (Mythos 5 shares Fable 5's pricing; Project-Glasswing access only.)
   'claude-fable-5':    { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 1.00 },
@@ -842,9 +916,9 @@ function isBillable(model) {
 function getPricing(model) {
   if (!model) return null;
   if (PRICING[model]) return PRICING[model];
-  for (const key of Object.keys(PRICING)) {
-    if (model.startsWith(key)) return PRICING[key];
-  }
+  const prefix = Object.keys(PRICING).filter(k => model.startsWith(k))
+    .sort((a, b) => b.length - a.length)[0];
+  if (prefix) return PRICING[prefix];
   const m = model.toLowerCase();
   if (m.includes('fable') || m.includes('mythos')) return PRICING['claude-fable-5'];
   if (m.includes('opus'))   return PRICING['claude-opus-4-8'];
@@ -951,8 +1025,10 @@ Chart.defaults.plugins.tooltip.callbacks.labelColor = (ctx) => {
 // series the user toggled off. We track hidden series by label per chart and
 // reapply on rebuild: dataset charts via `dataset.hidden`, the doughnut via
 // per-slice data visibility (see applyModelHidden).
-const hiddenSeries = { daily: new Set(), hourly: new Set(), project: new Set(), model: new Set(), subagent: new Set(), skill: new Set() };
+const hiddenSeries = { daily: new Set(), hourly: new Set(), project: new Set(), model: new Set(), subagent: new Set(), skill: new Set(), copilot: new Set() };
 let lastBySkill = [];
+let lastCopilotRows = [], lastCopilotChats = [];
+let openCopilotChat = null;  // session_id whose request list is open
 function legendToggle(key) {
   return (e, item, legend) => {
     const ci = legend.chart;
@@ -1399,6 +1475,7 @@ function applyFilter() {
   renderModelCostTable(lastByModel);
   renderProjectCostTable(lastByProject);
   renderProjectBranchCostTable(lastByProjectBranch);
+  renderCopilot(start, end);
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -1412,7 +1489,7 @@ function renderStats(t) {
     { label: 'Subagent Tokens', value: fmt(t.subagent_tokens || 0), sub: 'included in totals' },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
     { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, June 2026', color: C.green },
+    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, October 2026', color: C.green },
   ];
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
@@ -1757,13 +1834,22 @@ function skillRowHtml(s) {
     </tr>`;
 }
 
-// Inner table for an opened Recent Sessions row: that session's project skills.
-// No date cut (the session is already in range); the model filter still applies.
+// Detail of an opened Recent Sessions row: that session's project skills and
+// subagent dispatches. No date cut (the session is already in range); the
+// model filter still applies.
 function renderSessionSkills(sessionId) {
   const bySkill = aggregateSkills(rawData.skill_runs || [], null, null, sessionId);
-  if (!bySkill.length) return '<div class="muted session-detail-empty">No project skills ran in this session.</div>';
-  return `<table class="session-skills"><thead><tr>${SKILL_HEADERS.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-    <tbody>${bySkill.map(skillRowHtml).join('')}</tbody></table>`;
+  const dispatches = (rawData.top_dispatches || []).filter(d =>
+    d.session_id === sessionId && selectedModels.has(d.model));
+  return detailTable('Project skills', SKILL_HEADERS, bySkill.map(skillRowHtml), 'No project skills ran in this session.')
+       + detailTable('Subagents', DISPATCH_HEADERS, dispatches.map(dispatchRowHtml), 'No subagents ran in this session.');
+}
+
+function detailTable(title, headers, rows, emptyText) {
+  const body = rows.length
+    ? `<table class="session-skills"><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>`
+    : `<div class="muted session-detail-empty">${emptyText}</div>`;
+  return `<div class="detail-title">${title}</div>${body}`;
 }
 
 function toggleSession(e) {
@@ -1774,6 +1860,152 @@ function toggleSession(e) {
   document.querySelector(`#sessions-body tr.session-row[data-sid="${CSS.escape(row.dataset.sid)}"]`)?.focus();
 }
 
+// ── GitHub Copilot ─────────────────────────────────────────────────────────
+// Copilot bills in credits, not per token, so credits are shown as-is (never
+// converted to $). The Claude model filter does not apply; the range does.
+function fmtCredits(n) { return n.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 }); }
+
+function renderCopilot(start, end) {
+  const all = rawData.copilot_requests || [];
+  document.querySelectorAll('.copilot-only').forEach(el => { el.hidden = !all.length; });
+  if (!all.length) return;
+  const rows = all.filter(r => (!start || r.day >= start) && (!end || r.day <= end));
+  const { models, chats } = aggregateCopilot(rows);
+  lastCopilotRows = rows;
+  lastCopilotChats = chats;
+
+  const credits = rows.reduce((s, r) => s + r.credits, 0);
+  const output = rows.reduce((s, r) => s + r.output, 0);
+  document.getElementById('copilot-chart-title').textContent = 'GitHub Copilot Credits by Day — ' + RANGE_LABELS[selectedRange];
+  document.getElementById('copilot-kpis').innerHTML = [
+    ['Requests', rows.length.toLocaleString()], ['Chats', lastCopilotChats.length.toLocaleString()],
+    ['Credits', fmtCredits(credits)], ['Output tok', fmt(output)],
+  ].map(([k, v]) => `<span class="kpi-chip">${k} <b>${v}</b></span>`).join('');
+
+  renderCopilotChart(rows, models);
+  renderCopilotModels(models);
+  renderCopilotChats();
+}
+
+// Group request rows by model (sorted by credits) and by chat (latest first).
+function aggregateCopilot(rows) {
+  const byModel = {}, byChat = {};
+  for (const r of rows) {
+    const m = byModel[r.model] ||= { model: r.model, requests: 0, rounds: 0, prompt: 0, output: 0, credits: 0 };
+    m.requests++; m.rounds += r.rounds; m.prompt += r.prompt; m.output += r.output; m.credits += r.credits;
+    const c = byChat[r.session_id] ||= { session_id: r.session_id, title: r.title, workspace: r.workspace, last: r.ts, requests: [], output: 0, credits: 0 };
+    c.requests.push(r); c.output += r.output; c.credits += r.credits;
+    if (r.ts > c.last) c.last = r.ts;
+  }
+  return {
+    models: Object.values(byModel).sort((a, b) => b.credits - a.credits || b.requests - a.requests),
+    chats:  Object.values(byChat).sort((a, b) => b.last.localeCompare(a.last)),
+  };
+}
+
+function renderCopilotModels(models) {
+  document.getElementById('copilot-model-body').innerHTML = models.length ? models.map(m => `<tr>
+      <td><span class="model-tag">${esc(m.model)}</span></td>
+      <td class="num">${m.requests}</td>
+      <td class="num muted">${m.rounds}</td>
+      <td class="num muted">${fmt(m.prompt)}</td>
+      <td class="num">${fmt(m.output)}</td>
+      <td class="credits">${fmtCredits(m.credits)}</td>
+      <td class="credits muted">${fmtCredits(m.credits / m.requests)}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">No Copilot requests in selected range.</td></tr>';
+}
+
+// Stacked credits per day: the top 6 models by credits, the rest as "Other".
+function renderCopilotChart(rows, models) {
+  const ctx = document.getElementById('chart-copilot').getContext('2d');
+  if (charts.copilot) charts.copilot.destroy();
+  charts.copilot = null;
+  if (!rows.length) return;
+  const top = models.slice(0, 6).map(m => m.model);
+  const series = models.length > 6 ? [...top, 'Other'] : top;
+  const days = [...new Set(rows.map(r => r.day))].sort();
+  const grid = Object.fromEntries(series.map(s => [s, Object.fromEntries(days.map(d => [d, 0]))]));
+  for (const r of rows) grid[top.includes(r.model) ? r.model : 'Other'][r.day] += r.credits;
+  charts.copilot = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: days,
+      datasets: series.map((s, i) => ({
+        label: s, hidden: hiddenSeries.copilot.has(s), data: days.map(d => grid[s][d]),
+        backgroundColor: s === 'Other' ? C.border : MODEL_COLORS[i % MODEL_COLORS.length], stack: 'credits',
+      })),
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, resizeDelay: 150,
+      plugins: {
+        legend: { onClick: legendToggle('copilot'), labels: { color: C.axis, boxWidth: 12 } },
+        tooltip: { callbacks: {
+          label: item => ` ${item.dataset.label}: ${fmtCredits(item.raw)} credits`,
+          footer: items => ` Total: ${fmtCredits(items.reduce((s, it) => s + it.raw, 0))} credits`,
+        } },
+      },
+      scales: {
+        x: { stacked: true, ticks: { color: C.axis, maxTicksLimit: RANGE_TICKS[selectedRange] }, grid: { color: C.border } },
+        y: { stacked: true, ticks: { color: C.axis, callback: v => fmt(v) }, grid: { color: C.border }, title: { display: true, text: 'Credits', color: C.axis } },
+      },
+    },
+  });
+}
+
+function topModel(requests) {
+  const n = {};
+  for (const r of requests) n[r.model] = (n[r.model] || 0) + 1;
+  return Object.entries(n).sort((a, b) => b[1] - a[1])[0][0];
+}
+
+function renderCopilotChats() {
+  const all = lastCopilotChats;
+  const chats = all.slice(0, shownCount(copilotChatsLimit, all.length));
+  if (!chats.some(c => c.session_id === openCopilotChat)) openCopilotChat = null;
+  const body = document.getElementById('copilot-chats-body');
+  renderTableToggle('copilot-chats-foot', all.length, copilotChatsLimit, 'lessCopilotChats', 'moreCopilotChats', 'exportCopilotCSV');
+  if (!chats.length) {
+    body.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">No Copilot chats in selected range.</td></tr>';
+    return;
+  }
+  body.innerHTML = chats.map(c => {
+    const open = c.session_id === openCopilotChat;
+    const title = c.title ? esc(c.title) : '<span class="untitled">Untitled</span>';
+    const detail = open ? `<tr class="session-detail"><td colspan="7">${copilotRequestsHtml(c.requests)}</td></tr>` : '';
+    return `<tr class="session-row${open ? ' open' : ''}" data-sid="${esc(c.session_id)}" tabindex="0" aria-expanded="${open}" title="Show the requests in this chat">
+      <td class="topic-cell"><span class="row-caret">${open ? '&#9662;' : '&#9656;'}</span>${title}</td>
+      <td>${esc(c.workspace)}</td>
+      <td class="muted">${esc(c.last.slice(0, 16).replace('T', ' '))}</td>
+      <td><span class="model-tag">${esc(topModel(c.requests))}</span></td>
+      <td class="num">${c.requests.length}</td>
+      <td class="num">${fmt(c.output)}</td>
+      <td class="credits">${fmtCredits(c.credits)}</td>
+    </tr>${detail}`;
+  }).join('');
+}
+
+function copilotRequestsHtml(requests) {
+  const rows = requests.map(r => `<tr>
+      <td class="muted">${esc(r.ts.slice(0, 19).replace('T', ' '))}</td>
+      <td><span class="model-tag">${esc(r.model)}</span></td>
+      <td class="num">${r.rounds}</td>
+      <td class="muted">${fmtDuration(r.elapsed_ms)}</td>
+      <td class="num muted">${fmt(r.prompt)}</td>
+      <td class="num">${fmt(r.output)}</td>
+      <td class="credits">${fmtCredits(r.credits)}</td>
+    </tr>`).join('');
+  return `<table class="session-skills"><thead><tr><th>Time (UTC)</th><th>Model</th><th>Tool Rounds</th><th>Duration</th><th>Prompt (ctx)</th><th>Output</th><th>Credits</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function toggleCopilotChat(e) {
+  const row = e.target.closest('tr.session-row');
+  if (!row || (e.type === 'keydown' && e.key !== 'Enter')) return;
+  openCopilotChat = openCopilotChat === row.dataset.sid ? null : row.dataset.sid;
+  renderCopilotChats();
+  document.querySelector(`#copilot-chats-body tr.session-row[data-sid="${CSS.escape(row.dataset.sid)}"]`)?.focus();
+}
+
 function renderTopDispatches(rows) {
   const body = document.getElementById('dispatches-body');
   if (!rows.length) {
@@ -1782,7 +2014,14 @@ function renderTopDispatches(rows) {
     return;
   }
   const shown = rows.slice(0, shownCount(dispatchesLimit, rows.length));
-  body.innerHTML = shown.map(d => {
+  body.innerHTML = shown.map(dispatchRowHtml).join('');
+  renderTableToggle('dispatches-foot', rows.length, dispatchesLimit, 'lessDispatchRows', 'moreDispatchRows', 'exportDispatchesCSV');
+}
+
+const DISPATCH_HEADERS = ['Type', 'Started', 'Model', 'Turns', 'Tool Uses', 'Duration',
+                          'Input', 'Output', 'Cache Read', 'Tokens', 'Est. Cost'];
+
+function dispatchRowHtml(d) {
     const tokensTotal = d.input + d.output + d.cache_read + d.cache_creation;
     const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation);
     const costCell = isBillable(d.model)
@@ -1803,8 +2042,6 @@ function renderTopDispatches(rows) {
       <td class="num"><strong>${fmt(tokensTotal)}</strong></td>
       ${costCell}
     </tr>`;
-  }).join('');
-  renderTableToggle('dispatches-foot', rows.length, dispatchesLimit, 'lessDispatchRows', 'moreDispatchRows', 'exportDispatchesCSV');
 }
 
 // Fills a table card's footer with the row-reveal control. Three states:
@@ -1850,6 +2087,8 @@ function lessProjectRows() { projectLimit  = TABLE_STEPS[0]; renderProjectCostTa
 function moreBranchRows()  { branchLimit   = nextTableLimit(branchLimit,   lastByProjectBranch.length); renderProjectBranchCostTable(lastByProjectBranch); }
 function lessBranchRows()  { branchLimit   = TABLE_STEPS[0]; renderProjectBranchCostTable(lastByProjectBranch); scrollTableToTop('project-branch-cost-body'); }
 function moreDispatchRows(){ dispatchesLimit = nextTableLimit(dispatchesLimit, lastFilteredDispatches.length); renderTopDispatches(lastFilteredDispatches); }
+function moreCopilotChats(){ copilotChatsLimit = nextTableLimit(copilotChatsLimit, lastCopilotChats.length); renderCopilotChats(); }
+function lessCopilotChats(){ copilotChatsLimit = TABLE_STEPS[0]; renderCopilotChats();                                     scrollTableToTop('copilot-chats-body'); }
 function lessDispatchRows(){ dispatchesLimit = TABLE_STEPS[0]; renderTopDispatches(lastFilteredDispatches);            scrollTableToTop('dispatches-body'); }
 
 function renderSessionsTable(sessions) {
@@ -2111,6 +2350,12 @@ function exportSkillsCSV() {
   const rows = lastBySkill.map(s => [s.skill, s.uses, s.auto, s.user, s.turns, s.duration_ms, s.load_tokens,
     s.input, s.output, s.cache_read, s.cache_creation, s.tokens, s.cost.toFixed(4)]);
   downloadCSV('project_skills', header, rows);
+}
+
+function exportCopilotCSV() {
+  const header = ['Time (UTC)', 'Chat', 'Workspace', 'Model', 'Tool Rounds', 'Duration (ms)', 'Prompt Tokens (ctx)', 'Output Tokens', 'Credits', 'Session ID'];
+  const rows = lastCopilotRows.map(r => [r.ts, r.title, r.workspace, r.model, r.rounds, r.elapsed_ms, r.prompt, r.output, r.credits.toFixed(4), r.session_id]);
+  downloadCSV('copilot_requests', header, rows);
 }
 
 // ── Rescan ────────────────────────────────────────────────────────────────
@@ -2396,9 +2641,15 @@ function initSectionNav() {
 
 initFooterMeta();
 initSectionNav();
+// Show the Top button once the page is scrolled past one screen.
+const toTop = document.getElementById('to-top');
+window.addEventListener('scroll', () => { toTop.hidden = window.scrollY < window.innerHeight; }, { passive: true });
 const sessionsBody = document.getElementById('sessions-body');
 sessionsBody.addEventListener('click', toggleSession);
 sessionsBody.addEventListener('keydown', toggleSession);
+const copilotChatsBody = document.getElementById('copilot-chats-body');
+copilotChatsBody.addEventListener('click', toggleCopilotChat);
+copilotChatsBody.addEventListener('keydown', toggleCopilotChat);
 loadData();
 scheduleAutoRefresh();
 </script>
@@ -2497,6 +2748,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             result = scanner.scan(
                 db_path=db_path,
                 projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
+                copilot_dirs=scanner.COPILOT_DIRS,
                 verbose=False,
             )
             body = json.dumps(result).encode("utf-8")

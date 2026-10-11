@@ -60,7 +60,7 @@ A conditional unique index on `turns.message_id` (where non-empty) lets `INSERT 
 
 ### Non-obvious invariants
 
-These four things will bite you if you don't know them:
+These five things will bite you if you don't know them:
 
 1. **Streaming dedupe by `message.id`.** Claude Code writes multiple JSONL records per API response — only the *last* one for a given `message.id` has the final usage tallies. `parse_jsonl_file` keeps the last record per `message_id` in a dict; earlier records are discarded. Don't sum across records of the same `message_id`.
 
@@ -69,6 +69,8 @@ These four things will bite you if you don't know them:
 3. **Session primary model priority is opus > sonnet > haiku** (`_model_priority` in [scanner.py](scanner.py)). This prevents a subagent's haiku turn from overwriting the session's opus model when an existing session is updated. Per-turn model is always honored in the `turns` table; only the session-level summary uses the priority.
 
 4. **Skill tokens are attributed by window, not measured.** A skill has no usage of its own. It injects SKILL.md into the main thread as an `isMeta` user record that starts with `Base directory for this skill:` (the record has `sourceToolUseID` when the model started the skill, and none when the user typed `/skill-name`). `skill_events` stores project-skill loads and real user prompts. `get_dashboard_data` gives a run the main-thread turns after the load, up to the session's next event, so no turn is counted twice. "Project skill" means the base dir is not under `~/.claude` or `~/.agents`. Transcripts scanned before `skill_events` existed are backfilled once, gated by `schema_meta.skill_backfill_done`.
+
+5. **Copilot chat files are change logs, and their token fields are not alike.** VS Code writes each Copilot chat as JSONL patches (`kind` 0 = snapshot, 1 = set at path `k`, 2 = append at `k`, cutting the array to `i` first). `scan_copilot` replays a changed file whole and replaces that chat's rows in `copilot_requests`. Per request, `completionTokens` is the total over all tool-call rounds, but `promptTokens` is one call's prompt (context size), not a sum. So never add Copilot prompt tokens to Claude input tokens or price them per token: `copilotCredits` is what Copilot bills. Copilot rows stay out of `turns`/`sessions`. `scan()` reads `COPILOT_DIRS` at call time; tests patch it to `[]`.
 
 ### Cost calculation
 
@@ -84,7 +86,7 @@ Pricing is duplicated in two places that **must stay in sync**:
 
 `http.server.BaseHTTPRequestHandler`-based, two endpoints:
 - `GET /api/data` → JSON snapshot from `get_dashboard_data()`. Returns *all* history; client-side filters by date range and model.
-- `POST /api/rescan` → deletes the DB and runs a full rescan. Passes `db_path` and `projects_dirs` explicitly so tests that monkey-patch the module globals work — scan's default arg values are frozen at def time, so don't switch to bare defaults.
+- `POST /api/rescan` → runs an incremental scan and never deletes the DB (it is the only store of history after transcripts are pruned; see the #138 regression test). Passes `db_path`, `projects_dirs` and `copilot_dirs` explicitly so tests that monkey-patch the module globals work — scan's default arg values are frozen at def time, so don't switch to bare defaults.
 
 The entire UI lives in `HTML_TEMPLATE` as a raw string. Chart.js is loaded from CDN.
 

@@ -270,6 +270,7 @@ class TestDashboardHTTP(unittest.TestCase):
             (_s, "DB_PATH"):                (_s.DB_PATH,                tmp / "usage.db"),
             (_s, "PROJECTS_DIR"):           (_s.PROJECTS_DIR,           tmp_projects),
             (_s, "DEFAULT_PROJECTS_DIRS"):  (_s.DEFAULT_PROJECTS_DIRS,  [tmp_projects]),
+            (_s, "COPILOT_DIRS"):           (_s.COPILOT_DIRS,           []),
         }
         for (mod, name), (_orig, new) in cls._patches.items():
             setattr(mod, name, new)

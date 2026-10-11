@@ -18,7 +18,24 @@ from scanner import VERSION
 
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
 
+# Anthropic API list prices, $/MTok (platform.claude.com/docs/en/about-claude/pricing,
+# October 2026). cache_write is the 5-minute rate. Keys are model-id prefixes;
+# get_pricing picks the longest matching key, so order does not matter.
 PRICING = {
+    "claude-fable-5-1":  {"input": 10.00, "output": 50.00, "cache_read": 0.25, "cache_write": 12.50},
+    "claude-mythos-5-1": {"input": 10.00, "output": 50.00, "cache_read": 0.25, "cache_write": 12.50},
+    "claude-opus-5-5":   {"input":  4.00, "output": 20.00, "cache_read": 0.20, "cache_write":  5.00},
+    "claude-opus-5":     {"input":  5.00, "output": 25.00, "cache_read": 0.50, "cache_write":  6.25},
+    "claude-opus-4-1":   {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
+    "claude-opus-4":     {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_write": 18.75},
+    "claude-sonnet-5-5": {"input":  2.00, "output": 10.00, "cache_read": 0.10, "cache_write":  2.50},
+    "claude-sonnet-5":   {"input":  2.00, "output": 10.00, "cache_read": 0.20, "cache_write":  2.50},
+    "claude-sonnet-4":   {"input":  3.00, "output": 15.00, "cache_read": 0.30, "cache_write":  3.75},
+    "claude-3-5-haiku":  {"input":  0.80, "output":  4.00, "cache_read": 0.08, "cache_write":  1.00},
+    # ponytail: Haiku 5.5 is tiered by prompt size; costs are priced from
+    # aggregates, so the <=100K-token tier is used. Prompts >100K tokens cost
+    # 5x (input 0.50, output 2.50, cache 0.05 / 0.625): price per turn if it matters.
+    "claude-haiku-5-5":  {"input":  0.10, "output":  0.50, "cache_read": 0.01, "cache_write":  0.125},
     # Fable / Mythos — Anthropic's most capable class, priced at 2x Opus.
     # (Mythos 5 shares Fable 5's pricing; Project-Glasswing access only.)
     "claude-fable-5":    {"input": 10.00, "output": 50.00, "cache_read": 1.00, "cache_write": 12.50},
@@ -40,9 +57,9 @@ def get_pricing(model):
         return None
     if model in PRICING:
         return PRICING[model]
-    for key in PRICING:
-        if model.startswith(key):
-            return PRICING[key]
+    prefixes = [key for key in PRICING if model.startswith(key)]
+    if prefixes:
+        return PRICING[max(prefixes, key=len)]
     # Substring fallback: match model family by keyword
     m = model.lower()
     if "fable" in m or "mythos" in m:

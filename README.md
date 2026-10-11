@@ -142,12 +142,22 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/`. Each lin
 
 ## Cost estimates
 
-Costs are calculated using **Anthropic API pricing as of June 2026** ([claude.com/pricing#api](https://claude.com/pricing#api)).
+Costs are calculated using **Anthropic API pricing as of October 2026** ([claude.com/pricing#api](https://claude.com/pricing#api)).
 
 **Only models whose name contains `fable`, `mythos`, `opus`, `sonnet`, or `haiku` are included in cost calculations.** Local models, unknown models, and any other model names are excluded (shown as `n/a`).
 
 | Model | Input | Output | Cache Write | Cache Read |
 |-------|-------|--------|------------|-----------|
+| claude-fable-5-1 | $10.00/MTok | $50.00/MTok | $12.50/MTok | $0.25/MTok |
+| claude-opus-5-5 | $4.00/MTok | $20.00/MTok | $5.00/MTok | $0.20/MTok |
+| claude-sonnet-5-5 | $2.00/MTok | $10.00/MTok | $2.50/MTok | $0.10/MTok |
+| claude-haiku-5-5 ¹ | $0.10/MTok | $0.50/MTok | $0.125/MTok | $0.01/MTok |
+| claude-mythos-5-1 | $10.00/MTok | $50.00/MTok | $12.50/MTok | $0.25/MTok |
+| claude-opus-5 | $5.00/MTok | $25.00/MTok | $6.25/MTok | $0.50/MTok |
+| claude-opus-4-1, claude-opus-4 | $15.00/MTok | $75.00/MTok | $18.75/MTok | $1.50/MTok |
+| claude-sonnet-5 | $2.00/MTok | $10.00/MTok | $2.50/MTok | $0.20/MTok |
+| claude-sonnet-4 | $3.00/MTok | $15.00/MTok | $3.75/MTok | $0.30/MTok |
+| claude-3-5-haiku | $0.80/MTok | $4.00/MTok | $1.00/MTok | $0.08/MTok |
 | claude-fable-5 | $10.00/MTok | $50.00/MTok | $12.50/MTok | $1.00/MTok |
 | claude-mythos-5 | $10.00/MTok | $50.00/MTok | $12.50/MTok | $1.00/MTok |
 | claude-opus-4-8 | $5.00/MTok | $25.00/MTok | $6.25/MTok | $0.50/MTok |
@@ -155,6 +165,8 @@ Costs are calculated using **Anthropic API pricing as of June 2026** ([claude.co
 | claude-opus-4-6 | $5.00/MTok | $25.00/MTok | $6.25/MTok | $0.50/MTok |
 | claude-sonnet-4-6 | $3.00/MTok | $15.00/MTok | $3.75/MTok | $0.30/MTok |
 | claude-haiku-4-5 | $1.00/MTok | $5.00/MTok | $1.25/MTok | $0.10/MTok |
+
+¹ Haiku 5.5 rates are for prompts up to 100K tokens; longer prompts cost 5x. Costs are estimated with the lower tier. Cache Write is the 5-minute rate; 1-hour cache writes cost 1.6x that and are currently priced at the 5-minute rate.
 
 > **Note:** These are API prices. If you use Claude Code via a Max or Pro subscription, your actual cost structure is different (subscription-based, not per-token).
 

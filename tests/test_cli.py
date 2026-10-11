@@ -56,6 +56,26 @@ class TestGetPricing(unittest.TestCase):
         self.assertEqual(p["input"], 5.00)
         self.assertEqual(p["output"], 25.00)
 
+    def test_october_2026_models(self):
+        cases = {"claude-fable-5-1": (10.00, 50.00, 0.25), "claude-fable-5-1-20261001": (10.00, 50.00, 0.25),
+                 "claude-opus-5-5": (4.00, 20.00, 0.20), "claude-sonnet-5-5": (2.00, 10.00, 0.10),
+                 "claude-haiku-5-5": (0.10, 0.50, 0.01), "claude-fable-5-20260601": (10.00, 50.00, 1.00)}
+        for model, expected in cases.items():
+            p = get_pricing(model)
+            self.assertEqual((p["input"], p["output"], p["cache_read"]), expected, model)
+
+    def test_longest_prefix_wins(self):
+        """Short keys (claude-opus-4, claude-sonnet-5) must not capture newer
+        dated ids that share their prefix."""
+        cases = {"claude-opus-4-20250514": 15.00, "claude-opus-4-1-20250805": 15.00,
+                 "claude-opus-4-8-20260801": 5.00, "claude-opus-5-20260301": 5.00,
+                 "claude-opus-5-5-20261001": 4.00, "claude-sonnet-4-20250514": 3.00,
+                 "claude-sonnet-5-20260601": 2.00, "claude-3-5-haiku-20241022": 0.80}
+        for model, inp in cases.items():
+            self.assertEqual(get_pricing(model)["input"], inp, model)
+        self.assertEqual(get_pricing("claude-sonnet-5-5-20261001")["cache_read"], 0.10)
+        self.assertEqual(get_pricing("claude-sonnet-5-20260601")["cache_read"], 0.20)
+
     def test_opus_4_7_has_explicit_entry(self):
         """Regression guard for issue #61 — Opus 4.7 must be present."""
         p = get_pricing("claude-opus-4-7")

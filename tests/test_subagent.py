@@ -146,6 +146,46 @@ class TestSubagentScanIntegration(unittest.TestCase):
         self.assertEqual(main_turn["is_subagent"], 0)
         conn.close()
 
+    def test_background_agent_type_comes_from_meta_file(self):
+        # A background launch: toolUseResult has isAsync and no agentType.
+        parent = self.projects_dir / "proj"
+        parent.mkdir(parents=True)
+        launch = json.dumps({"type": "user", "sessionId": "sess-2", "timestamp": "2026-10-10T22:45:48Z",
+                             "toolUseResult": {"isAsync": True, "status": "async_launched",
+                                               "agentId": "abc123"}})
+        (parent / "sess-2.jsonl").write_text(launch + NL)
+        sub = parent / "sess-2" / "subagents"
+        sub.mkdir(parents=True)
+        (sub / "agent-abc123.jsonl").write_text(
+            _assistant(session_id="sess-2", message_id="m1", extra={"agentId": "abc123",
+                       "timestamp": "2026-10-10T22:45:50Z"}) + NL +
+            _assistant(session_id="sess-2", message_id="m2", extra={"agentId": "abc123",
+                       "timestamp": "2026-10-10T22:46:20Z"}) + NL)
+        (sub / "agent-abc123.meta.json").write_text(json.dumps({"agentType": "general-purpose"}))
+
+        scan(projects_dir=self.projects_dir, db_path=self.db_path, verbose=False)
+        scan(projects_dir=self.projects_dir, db_path=self.db_path, verbose=False)  # stays typed
+
+        import dashboard
+        d = dashboard.get_dashboard_data(self.db_path)
+        row = next(r for r in d["top_dispatches"] if r["agent_id"] == "abc123")
+        self.assertEqual((row["agent_type"], row["duration_ms"], row["status"]),
+                         ("general-purpose", 30000, None))
+        self.assertEqual(row["session_id"], "sess-2")
+        self.assertEqual({r["agent_type"] for r in d["subagent_by_type"]}, {"general-purpose"})
+
+    def test_session_starting_with_title_record_gets_project_from_cwd(self):
+        parent = self.projects_dir / "proj"
+        parent.mkdir(parents=True)
+        title = json.dumps({"type": "ai-title", "sessionId": "sess-3", "aiTitle": "Hello"})
+        (parent / "sess-3.jsonl").write_text(
+            title + NL + _assistant(session_id="sess-3", cwd="C:/Users/me/VS/Dev.Bud") + NL)
+        scan(projects_dir=self.projects_dir, db_path=self.db_path, verbose=False)
+        conn = sqlite3.connect(self.db_path)
+        name = conn.execute("SELECT project_name FROM sessions WHERE session_id='sess-3'").fetchone()[0]
+        conn.close()
+        self.assertEqual(name, "VS/Dev.Bud")
+
     def test_migration_adds_subagent_columns_and_agents_table(self):
         conn = sqlite3.connect(self.db_path)
         conn.executescript(

@@ -4,12 +4,19 @@
 
 ### Dashboard
 
+- Updated pricing to October 2026 (CLI, dashboard and README): added Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5. Opus 5.5 and Sonnet 5.5 had fallen back to Opus 4.8 / Sonnet 4.6 rates, which overstated their cost. Haiku 5.5 uses its ≤100K-token prompt tier. Also added every other model on the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing): Mythos 5.1, Opus 5, Opus 4.1, Opus 4, Sonnet 5, Sonnet 4 and Haiku 3.5. Prefix lookup now picks the longest matching key, so short keys such as `claude-opus-4` cannot capture newer dated ids such as `claude-opus-4-8-…`.
+
 - Added a **Project Skills** section: a token chart and a table per project skill (from the project's `.claude/skills/` or `.agents/skills/`) with Uses, Auto / User split, Turns, Duration, estimated load tokens, Input, Output, Cache Read, Cache Creation, total Tokens, and Est. Cost, plus CSV export. A run's tokens are the main-thread turns after the skill loads, up to the next user prompt or skill load. User-level, plugin, and built-in commands are excluded.
-- Made **Recent Sessions** rows expandable: click a row (or press Enter on it) to see the project skills used in that session, with the same per-skill usage columns.
+- Made **Recent Sessions** rows expandable: click a row (or press Enter on it) to see the project skills used in that session, with the same per-skill usage columns, and the subagents dispatched in that session with the Top Subagent Dispatches columns.
+- Added a floating **↑ Top** button at the bottom right that appears after scrolling one screen down and scrolls back to the top.
+- Added a **GitHub Copilot** section: credits by day stacked by model, a by-model table (Requests, Tool Rounds, Prompt context, Output, Credits, Credits / Req), and a chats table whose rows expand to their requests, plus CSV export. It follows the date range and is hidden when no Copilot chats exist. Credits are shown as Copilot records them, not converted to dollars.
 
 ### Scanner
 
 - Added a `skill_events` table that records project-skill loads (model-started via the Skill tool, or typed as `/skill-name`) and user-prompt boundaries, with a one-time backfill for transcripts scanned before this version.
+- Fixed background (async) subagents showing as type "unknown" with no duration: their type is now read from the `subagents/agent-<id>.meta.json` file Claude Code writes beside each subagent transcript (already-scanned agents included), and their duration falls back to the time from first to last turn. Sparse agent records no longer erase stored values.
+- Fixed sessions showing project "unknown" when their transcript starts with a title record (no `cwd`): each scan now names them from the `cwd` stored on their turns, which also repairs existing rows.
+- Added a GitHub Copilot Chat reader: VS Code (also Insiders and VSCodium) chat logs are replayed into a new `copilot_requests` table on every default scan and rescan. It is skipped when `--projects-dir` points the scan at a custom directory.
 
 ## v1.5.5 — 2026-07-10
 
