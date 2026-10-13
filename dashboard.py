@@ -2778,4 +2778,11 @@ def serve(host=None, port=None, surface=None):
 
 
 if __name__ == "__main__":
+    # Running the script directly: open the browser once the server is up.
+    # (cli.py dashboard opens its own browser, so this lives here, not in serve().)
+    import threading
+    import webbrowser
+
+    url = f"http://{os.environ.get('HOST', 'localhost')}:{os.environ.get('PORT', '8080')}"
+    threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     serve()
