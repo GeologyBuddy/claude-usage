@@ -65,23 +65,29 @@ def get_dashboard_data(db_path=DB_PATH):
     all_models = [r["model"] for r in model_rows]
 
     # ── Daily per-model, ALL history (client filters by range) ────────────────
-    daily_rows = conn.execute("""
+    # The project comes from the turn's session (same "unknown" fallback as
+    # sessions_all), so the client's project filter can cut these rows too.
+    PROJECT_EXPR = "COALESCE(NULLIF(s.project_name, ''), 'unknown')"
+    daily_rows = conn.execute(f"""
         SELECT
-            substr(timestamp, 1, 10)   as day,
-            COALESCE(NULLIF(model, ''), 'unknown') as model,
-            SUM(input_tokens)          as input,
-            SUM(output_tokens)         as output,
-            SUM(cache_read_tokens)     as cache_read,
-            SUM(cache_creation_tokens) as cache_creation,
+            substr(t.timestamp, 1, 10)   as day,
+            COALESCE(NULLIF(t.model, ''), 'unknown') as model,
+            {PROJECT_EXPR}             as project,
+            SUM(t.input_tokens)          as input,
+            SUM(t.output_tokens)         as output,
+            SUM(t.cache_read_tokens)     as cache_read,
+            SUM(t.cache_creation_tokens) as cache_creation,
             COUNT(*)                   as turns
-        FROM turns
-        GROUP BY day, COALESCE(NULLIF(model, ''), 'unknown')
-        ORDER BY day, model
+        FROM turns t
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        GROUP BY day, COALESCE(NULLIF(t.model, ''), 'unknown'), project
+        ORDER BY day, t.model, project
     """).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
         "model":          r["model"],
+        "project":        r["project"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -91,23 +97,26 @@ def get_dashboard_data(db_path=DB_PATH):
 
     # ── Hourly per-day per-model (client filters by range + TZ-shifts) ────────
     # Timestamps are ISO8601 UTC (e.g. "2026-04-08T09:30:00Z"); chars 12-13 = hour.
-    hourly_rows = conn.execute("""
+    hourly_rows = conn.execute(f"""
         SELECT
-            substr(timestamp, 1, 10)                  as day,
-            CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
-            COALESCE(NULLIF(model, ''), 'unknown')    as model,
-            SUM(output_tokens)                        as output,
-            COUNT(*)                                  as turns
-        FROM turns
-        WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
-        GROUP BY day, hour, COALESCE(NULLIF(model, ''), 'unknown')
-        ORDER BY day, hour, model
+            substr(t.timestamp, 1, 10)                  as day,
+            CAST(substr(t.timestamp, 12, 2) AS INTEGER) as hour,
+            COALESCE(NULLIF(t.model, ''), 'unknown')    as model,
+            {PROJECT_EXPR}                              as project,
+            SUM(t.output_tokens)                        as output,
+            COUNT(*)                                    as turns
+        FROM turns t
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        WHERE t.timestamp IS NOT NULL AND length(t.timestamp) >= 13
+        GROUP BY day, hour, COALESCE(NULLIF(t.model, ''), 'unknown'), project
+        ORDER BY day, hour, t.model, project
     """).fetchall()
 
     hourly_by_model = [{
         "day":    r["day"],
         "hour":   r["hour"] if r["hour"] is not None else 0,
         "model":  r["model"],
+        "project": r["project"],
         "output": r["output"] or 0,
         "turns":  r["turns"] or 0,
     } for r in hourly_rows]
@@ -164,6 +173,7 @@ def get_dashboard_data(db_path=DB_PATH):
             substr(t.timestamp, 1, 10)               as day,
             {AGENT_TYPE_EXPR}                        as agent_type,
             COALESCE(NULLIF(t.model, ''), 'unknown') as model,
+            {PROJECT_EXPR}                           as project,
             SUM(t.input_tokens)                      as input,
             SUM(t.output_tokens)                     as output,
             SUM(t.cache_read_tokens)                 as cache_read,
@@ -172,8 +182,9 @@ def get_dashboard_data(db_path=DB_PATH):
             COUNT(*)                                 as turns
         FROM turns t
         LEFT JOIN agents a ON t.agent_id = a.agent_id
+        LEFT JOIN sessions s ON s.session_id = t.session_id
         WHERE t.is_subagent = 1
-        GROUP BY day, agent_type, model
+        GROUP BY day, agent_type, COALESCE(NULLIF(t.model, ''), 'unknown'), project
         ORDER BY day, agent_type
     """).fetchall()
 
@@ -181,6 +192,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "day":            r["day"],
         "agent_type":     r["agent_type"],
         "model":          r["model"],
+        "project":        r["project"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -298,6 +310,7 @@ def get_dashboard_data(db_path=DB_PATH):
 
     return {
         "all_models":      all_models,
+        "all_projects":    list(dict.fromkeys(s["project"] for s in sessions_all)),
         "daily_by_model":  daily_by_model,
         "hourly_by_model": hourly_by_model,
         "sessions_all":    sessions_all,
@@ -553,6 +566,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="filter-btn" onclick="clearAllModels()">None</button>
       </div>
       <div id="model-checkboxes"></div>
+    </div>
+  </div>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Projects</div>
+  <div class="model-select" id="project-select">
+    <button class="model-trigger" id="project-trigger" aria-haspopup="true" aria-expanded="false" onclick="toggleProjectPanel(event)">
+      <span id="project-trigger-label">All projects</span>
+      <span class="model-caret">&#9662;</span>
+    </button>
+    <div class="model-panel" id="project-panel" hidden>
+      <div class="model-panel-actions">
+        <button class="filter-btn" onclick="selectAllProjects()">All</button>
+        <button class="filter-btn" onclick="clearAllProjects()">None</button>
+      </div>
+      <div id="project-checkboxes"></div>
     </div>
   </div>
   <div class="filter-sep"></div>
@@ -1277,12 +1305,94 @@ function clearAllModels() {
   updateModelTriggerLabel(); updateURL(); applyFilter();
 }
 
+// ── Project filter ─────────────────────────────────────────────────────────
+// Same dropdown as the model filter. Default is every project; a project that
+// first shows up after a rescan joins the selection so new work is never hidden.
+let allProjectsList = [];
+let selectedProjects = new Set();
+const projectOk = p => selectedProjects.has(p || 'unknown');
+let projectBySession = {};
+
+function syncProjects(allProjects) {
+  const first = !allProjectsList.length;
+  const added = allProjects.filter(p => !allProjectsList.includes(p));
+  allProjectsList = [...allProjects];
+  projectBySession = {};
+  for (const s of rawData.sessions_all) projectBySession[s.session_id] = s.project;
+  if (first) {
+    const param = new URLSearchParams(window.location.search).get('projects');
+    const fromURL = param ? new Set(param.split(',').map(s => s.trim()).filter(Boolean)) : null;
+    selectedProjects = new Set(fromURL ? allProjects.filter(p => fromURL.has(p)) : allProjects);
+  } else if (!added.length) {
+    return;
+  } else {
+    added.forEach(p => selectedProjects.add(p));
+  }
+  document.getElementById('project-checkboxes').innerHTML = allProjects.map(p => {
+    const checked = selectedProjects.has(p);
+    return `<label class="model-cb-label ${checked ? 'checked' : ''}" title="${esc(p)}">
+      <input type="checkbox" value="${esc(p)}" ${checked ? 'checked' : ''} onchange="onProjectToggle(this)">
+      <span class="model-cb-box">&#10003;</span>
+      <span class="model-cb-text">${esc(p)}</span>
+    </label>`;
+  }).join('');
+  updateProjectTriggerLabel();
+}
+
+function updateProjectTriggerLabel() {
+  const n = selectedProjects.size, total = allProjectsList.length;
+  const chosen = allProjectsList.filter(p => selectedProjects.has(p));
+  const text = n === total ? 'All projects' : n === 0 ? 'No projects'
+    : chosen.slice(0, 2).join(', ') + (n > 2 ? ' +' + (n - 2) : '');
+  document.getElementById('project-trigger-label').textContent = text;
+}
+
+function toggleProjectPanel(event) {
+  if (event) event.stopPropagation();
+  const panel = document.getElementById('project-panel');
+  const open = panel.hidden;
+  closeModelPanel();
+  panel.hidden = !open;
+  const trigger = document.getElementById('project-trigger');
+  trigger.classList.toggle('open', open);
+  trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function closeProjectPanel() {
+  const panel = document.getElementById('project-panel');
+  if (!panel || panel.hidden) return;
+  panel.hidden = true;
+  const trigger = document.getElementById('project-trigger');
+  trigger.classList.remove('open');
+  trigger.setAttribute('aria-expanded', 'false');
+}
+
+document.addEventListener('click', (e) => {
+  const sel = document.getElementById('project-select');
+  if (sel && !sel.contains(e.target)) closeProjectPanel();
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeProjectPanel(); });
+
+function setProjects(checked, only) {
+  document.querySelectorAll('#project-checkboxes input').forEach(cb => {
+    if (only && cb !== only) return;
+    cb.checked = checked;
+    cb.closest('label').classList.toggle('checked', checked);
+    if (checked) selectedProjects.add(cb.value); else selectedProjects.delete(cb.value);
+  });
+  updateProjectTriggerLabel(); updateURL(); applyFilter();
+}
+function onProjectToggle(cb) { setProjects(cb.checked, cb); }
+function selectAllProjects() { setProjects(true); }
+function clearAllProjects()  { setProjects(false); }
+
 // ── URL persistence ────────────────────────────────────────────────────────
 function updateURL() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
   const params = new URLSearchParams();
   if (selectedRange !== '30d') params.set('range', selectedRange);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
+  if (selectedProjects.size !== allProjectsList.length) params.set('projects', Array.from(selectedProjects).join(','));
   const search = params.toString() ? '?' + params.toString() : '';
   history.replaceState(null, '', window.location.pathname + search);
 }
@@ -1332,7 +1442,7 @@ function applyFilter() {
 
   // Filter daily rows by model + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
+    selectedModels.has(r.model) && projectOk(r.project) && (!start || r.day >= start) && (!end || r.day <= end)
   );
 
   // Daily chart: aggregate by day
@@ -1362,7 +1472,7 @@ function applyFilter() {
 
   // Filter sessions by model + date range
   const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
+    selectedModels.has(s.model) && projectOk(s.project) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
   );
 
   // Add session counts into modelMap
@@ -1413,20 +1523,20 @@ function applyFilter() {
     cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
     cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
     subagent_tokens: (rawData.subagent_by_type || [])
-      .filter(r => selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end))
+      .filter(r => selectedModels.has(r.model) && projectOk(r.project) && (!start || r.day >= start) && (!end || r.day <= end))
       .reduce((s, r) => s + r.input + r.output + r.cache_read + r.cache_creation, 0),
   };
 
   // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
+    selectedModels.has(r.model) && projectOk(r.project) && (!start || r.day >= start) && (!end || r.day <= end)
   );
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
 
   // Subagent breakdown by type (filtered by range + selected models)
   const subagentTypeMap = {};
   for (const r of (rawData.subagent_by_type || [])) {
-    if (!selectedModels.has(r.model)) continue;
+    if (!selectedModels.has(r.model) || !projectOk(r.project)) continue;
     if (start && r.day < start) continue;
     if (end && r.day > end) continue;
     const k = r.agent_type;
@@ -1444,7 +1554,7 @@ function applyFilter() {
   // (already ranked by tokens server-side) so the table can page it like Recent
   // Sessions — show more/less plus CSV export of everything.
   const filteredDispatches = (rawData.top_dispatches || []).filter(d =>
-    selectedModels.has(d.model) && (!start || d.start_date >= start) && (!end || d.start_date <= end)
+    selectedModels.has(d.model) && projectOk(projectBySession[d.session_id]) && (!start || d.start_date >= start) && (!end || d.start_date <= end)
   );
 
   const bySkill = aggregateSkills(rawData.skill_runs || [], start, end);
@@ -1687,7 +1797,8 @@ function renderProjectChart(byProject) {
   charts.project = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: top.map(p => p.project.length > 22 ? '\u2026' + p.project.slice(-20) : p.project),
+      // Full name, wrapped onto lines (Chart.js draws an array label as multiple lines).
+      labels: top.map(p => p.project.match(/.{1,24}/g) || [p.project]),
       datasets: [
         { label: 'Input',  hidden: hiddenSeries.project.has('Input'),  data: top.map(p => p.input),  backgroundColor: TOKEN_COLORS.input,  hoverBackgroundColor: TOKEN_HOVER.input },
         { label: 'Output', hidden: hiddenSeries.project.has('Output'), data: top.map(p => p.output), backgroundColor: TOKEN_COLORS.output, hoverBackgroundColor: TOKEN_HOVER.output },
@@ -1708,6 +1819,7 @@ function renderSubagentChart(byType) {
   const ctx = document.getElementById('chart-subagent').getContext('2d');
   if (charts.subagent) charts.subagent.destroy();
   if (!byType.length) { charts.subagent = null; return; }
+  fitRowsHeight('chart-subagent', byType.length);
   charts.subagent = new Chart(ctx, {
     type: 'bar',
     data: {
@@ -1734,10 +1846,15 @@ function renderSubagentChart(byType) {
       },
       scales: {
         x: { stacked: true, ticks: { color: C.axis, callback: v => fmt(v) }, grid: { color: C.border } },
-        y: { stacked: true, ticks: { color: C.axis, font: { size: 11 } }, grid: { color: C.border } },
+        y: { stacked: true, ticks: { color: C.axis, font: { size: 11 }, autoSkip: false }, grid: { color: C.border } },
       }
     }
   });
+}
+
+// Grow a horizontal-bar chart's box with its row count so every label fits.
+function fitRowsHeight(canvasId, rows) {
+  document.getElementById(canvasId).parentElement.style.height = Math.max(240, rows * 28 + 90) + 'px';
 }
 
 // Roll per-(run × model) rows up to one row per skill. A run counts as a use if
@@ -1749,6 +1866,7 @@ function aggregateSkills(rows, start, end, sessionId) {
   for (const r of rows) {
     if ((start && r.day < start) || (end && r.day > end)) continue;
     if (sessionId && r.session_id !== sessionId) continue;
+    if (!projectOk(projectBySession[r.session_id])) continue;
     if (!map[r.skill]) map[r.skill] = { skill: r.skill, uses: 0, auto: 0, user: 0, turns: 0, load_tokens: 0,
                                         input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0, runDur: {} };
     const m = map[r.skill];
@@ -1775,6 +1893,7 @@ function renderSkillChart(bySkill) {
   const ctx = document.getElementById('chart-skill').getContext('2d');
   if (charts.skill) charts.skill.destroy();
   if (!bySkill.length) { charts.skill = null; return; }
+  fitRowsHeight('chart-skill', bySkill.length);
   const series = [['Input', 'input'], ['Output', 'output'], ['Cache Read', 'cache_read'], ['Cache Creation', 'cache_creation']];
   charts.skill = new Chart(ctx, {
     type: 'bar',
@@ -1799,7 +1918,7 @@ function renderSkillChart(bySkill) {
       },
       scales: {
         x: { stacked: true, ticks: { color: C.axis, callback: v => fmt(v) }, grid: { color: C.border } },
-        y: { stacked: true, ticks: { color: C.axis, font: { size: 11 } }, grid: { color: C.border } },
+        y: { stacked: true, ticks: { color: C.axis, font: { size: 11 }, autoSkip: false }, grid: { color: C.border } },
       }
     }
   });
@@ -1837,12 +1956,40 @@ function skillRowHtml(s) {
 // Detail of an opened Recent Sessions row: that session's project skills and
 // subagent dispatches. No date cut (the session is already in range); the
 // model filter still applies.
-function renderSessionSkills(sessionId) {
+function renderSessionSkills(s) {
+  const sessionId = s.session_id;
   const bySkill = aggregateSkills(rawData.skill_runs || [], null, null, sessionId);
   const dispatches = (rawData.top_dispatches || []).filter(d =>
     d.session_id === sessionId && selectedModels.has(d.model));
-  return detailTable('Project skills', SKILL_HEADERS, bySkill.map(skillRowHtml), 'No project skills ran in this session.')
+  return detailTable('Main session', MAIN_HEADERS, [mainSessionRowHtml(s, dispatches)], '')
+       + detailTable('Project skills', SKILL_HEADERS, bySkill.map(skillRowHtml), 'No project skills ran in this session.')
        + detailTable('Subagents', DISPATCH_HEADERS, dispatches.map(dispatchRowHtml), 'No subagents ran in this session.');
+}
+
+const MAIN_HEADERS = ['Share', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Tokens', 'Est. Cost'];
+
+// Session totals include every subagent turn (scanner recomputes them from all
+// turns of the session), so the main thread is the total minus the dispatches.
+// Skill runs are windows of main-thread turns, so they stay inside this row.
+// Cost is priced at the session's primary model, as the session row is.
+function mainSessionRowHtml(s, dispatches) {
+  const sub = k => dispatches.reduce((a, d) => a + d[k], 0);
+  const main = { turns: s.turns - sub('turns'), input: s.input - sub('input'), output: s.output - sub('output'),
+                 cache_read: s.cache_read - sub('cache_read'), cache_creation: s.cache_creation - sub('cache_creation') };
+  const total = o => o.input + o.output + o.cache_read + o.cache_creation;
+  const all = total(s), tokens = total(main);
+  const share = all ? Math.round(100 * tokens / all) + '%' : '—';
+  const cost = calcCost(s.model, main.input, main.output, main.cache_read, main.cache_creation);
+  return `<tr>
+      <td class="num muted">${share}</td>
+      <td class="num">${main.turns}</td>
+      <td class="num">${fmt(main.input)}</td>
+      <td class="num">${fmt(main.output)}</td>
+      <td class="num">${fmt(main.cache_read)}</td>
+      <td class="num">${fmt(main.cache_creation)}</td>
+      <td class="num"><strong>${fmt(tokens)}</strong></td>
+      ${isBillable(s.model) ? `<td class="cost">${fmtCost(cost)}</td>` : '<td class="cost-na">n/a</td>'}
+    </tr>`;
 }
 
 function detailTable(title, headers, rows, emptyText) {
@@ -2104,7 +2251,7 @@ function renderSessionsTable(sessions) {
       : `<td class="topic-cell"><span class="untitled">Untitled</span></td>`;
     const open = s.session_id === openSession;
     const detail = open
-      ? `<tr class="session-detail"><td colspan="10">${renderSessionSkills(s.session_id)}</td></tr>`
+      ? `<tr class="session-detail"><td colspan="10">${renderSessionSkills(s)}</td></tr>`
       : '';
     return `<tr class="session-row${open ? ' open' : ''}" data-sid="${esc(s.session_id)}" tabindex="0" aria-expanded="${open}" title="Show project skills used in this session">
       <td class="muted" style="font-family:monospace"><span class="row-caret">${open ? '&#9662;' : '&#9656;'}</span>${esc(s.session_id.slice(0, 8))}&hellip;</td>
@@ -2395,6 +2542,7 @@ async function loadData() {
 
     const isFirstLoad = rawData === null;
     rawData = d;
+    syncProjects(d.all_projects || []);
 
     if (isFirstLoad) {
       // Restore range from URL into the dropdown
