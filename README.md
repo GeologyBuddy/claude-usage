@@ -142,12 +142,13 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/`. Each lin
 
 ## Cost estimates
 
-Costs are calculated using **Anthropic API pricing as of October 2026** ([claude.com/pricing#api](https://claude.com/pricing#api)).
+Costs are calculated using **Anthropic API pricing as of November 2026** ([claude.com/pricing#api](https://claude.com/pricing#api)).
 
 **Only models whose name contains `fable`, `mythos`, `opus`, `sonnet`, or `haiku` are included in cost calculations.** Local models, unknown models, and any other model names are excluded (shown as `n/a`).
 
 | Model | Input | Output | Cache Write | Cache Read |
 |-------|-------|--------|------------|-----------|
+| claude-fable-5-2, claude-mythos-5-2 | $8.00/MTok | $40.00/MTok | $10.00/MTok | $0.20/MTok |
 | claude-fable-5-1 | $10.00/MTok | $50.00/MTok | $12.50/MTok | $0.25/MTok |
 | claude-opus-5-5 | $4.00/MTok | $20.00/MTok | $5.00/MTok | $0.20/MTok |
 | claude-sonnet-5-5 | $2.00/MTok | $10.00/MTok | $2.50/MTok | $0.10/MTok |
@@ -166,7 +167,9 @@ Costs are calculated using **Anthropic API pricing as of October 2026** ([claude
 | claude-sonnet-4-6 | $3.00/MTok | $15.00/MTok | $3.75/MTok | $0.30/MTok |
 | claude-haiku-4-5 | $1.00/MTok | $5.00/MTok | $1.25/MTok | $0.10/MTok |
 
-¹ Haiku 5.5 rates are for prompts up to 100K tokens; longer prompts cost 5x. Costs are estimated with the lower tier. Cache Write is the 5-minute rate; 1-hour cache writes cost 1.6x that and are currently priced at the 5-minute rate.
+¹ Haiku 5.5 rates are for prompts up to 100K tokens. A turn whose prompt (input + cache read + cache write tokens) is over 100K tokens is priced at 5x on every rate. Cache Write is the 5-minute rate. 1-hour cache writes cost 2x the Input rate and are priced at that rate; turns whose transcript was pruned before v1.6.0 scanned it have no 5-minute / 1-hour split and stay at the 5-minute rate.
+
+A session can use several models (subagents often run a cheaper one). Each model's tokens are priced at that model's rate, so a session's cost is the sum of its main thread and its subagents.
 
 > **Note:** These are API prices. If you use Claude Code via a Max or Pro subscription, your actual cost structure is different (subscription-based, not per-token).
 

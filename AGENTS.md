@@ -76,11 +76,17 @@ These five things will bite you if you don't know them:
 
 Costs are computed **per turn** (each turn knows its own model), then summed. This is true in both the CLI ([cli.py](cli.py) `calc_cost`) and the dashboard JS ([dashboard.py](dashboard.py) `calcCost` inside the embedded HTML). Aggregating tokens first and applying a single price is wrong for sessions that span multiple models.
 
+In the dashboard JS, never call `calcCost` on a session's token totals. Use `sessionCost(s)`, which sums `s.by_model` (per-model rows of the session, main thread and subagents apart, from `get_dashboard_data`). Use `rowCost(r)` for any row that holds tokens of one model. `tests/test_cost.py` runs these JS functions in Node and checks that session = main thread + subagents = daily total = CLI `calc_cost`.
+
+Cache writes have two rates. `turns.cache_creation_tokens` is the total and `turns.cache_creation_1h_tokens` is its 1-hour-TTL part (from `usage.cache_creation.ephemeral_1h_input_tokens`), priced at `CACHE_WRITE_1H_MULTIPLIER` (2x) times the input rate; the rest uses the `cache_write` (5-minute) rate. Every query that feeds a cost must select both columns. Turns scanned before the column existed are backfilled once from the transcripts on disk (`schema_meta.cache_1h_backfill_done`).
+
+Haiku 5.5 bills a turn whose prompt (input + cache read + cache creation tokens) is over 100K tokens at `LONG_PROMPT_MULTIPLIER` (5x) on every rate. A cost query therefore also selects `scanner.long_prompt_sums_sql()`: the token sums of the long-prompt turns only (`long_*` columns; `r.long` in the dashboard JSON). `row_cost` / `rowCost` add the surcharge. In the dashboard JS, price only rows that came from the server: a row merged in the browser has lost `r.long`, so merges add up `rowCost(r)` and keep the sum.
+
 Pricing is duplicated in two places that **must stay in sync**:
 - [cli.py](cli.py) `PRICING` dict (Python)
 - [dashboard.py](dashboard.py) `PRICING` const inside `HTML_TEMPLATE` (JavaScript)
 
-`get_pricing` / `getPricing` resolve in three tiers: exact match → `startswith` (handles date-suffixed model IDs like `claude-opus-4-7-20260215`) → substring fallback on `opus` / `sonnet` / `haiku`. Models that don't match any tier return `None` and are billed at $0 (shown as `n/a`) — this is intentional so local/3rd-party models (gemma, glm, etc.) aren't charged at Sonnet rates.
+`get_pricing` / `getPricing` resolve in three tiers: exact match → longest `startswith` key that ends at a separator (handles date-suffixed model IDs like `claude-opus-4-7-20260215`, and keeps `claude-fable-5-20260601` away from the `claude-fable-5-2` key) → substring fallback on `opus` / `sonnet` / `haiku`. Models that don't match any tier return `None` and are billed at $0 (shown as `n/a`) — this is intentional so local/3rd-party models (gemma, glm, etc.) aren't charged at Sonnet rates.
 
 ### Dashboard server
 

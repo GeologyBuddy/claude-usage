@@ -14,14 +14,17 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
-from scanner import VERSION
+from scanner import VERSION, long_prompt_sums_sql
 
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
 
 # Anthropic API list prices, $/MTok (platform.claude.com/docs/en/about-claude/pricing,
-# October 2026). cache_write is the 5-minute rate. Keys are model-id prefixes;
-# get_pricing picks the longest matching key, so order does not matter.
+# November 2026). cache_write is the 5-minute rate; see CACHE_WRITE_1H_MULTIPLIER.
+# Keys are model-id prefixes; get_pricing picks the longest matching key, so
+# order does not matter.
 PRICING = {
+    "claude-fable-5-2":  {"input":  8.00, "output": 40.00, "cache_read": 0.20, "cache_write": 10.00},
+    "claude-mythos-5-2": {"input":  8.00, "output": 40.00, "cache_read": 0.20, "cache_write": 10.00},
     "claude-fable-5-1":  {"input": 10.00, "output": 50.00, "cache_read": 0.25, "cache_write": 12.50},
     "claude-mythos-5-1": {"input": 10.00, "output": 50.00, "cache_read": 0.25, "cache_write": 12.50},
     "claude-opus-5-5":   {"input":  4.00, "output": 20.00, "cache_read": 0.20, "cache_write":  5.00},
@@ -32,9 +35,8 @@ PRICING = {
     "claude-sonnet-5":   {"input":  2.00, "output": 10.00, "cache_read": 0.20, "cache_write":  2.50},
     "claude-sonnet-4":   {"input":  3.00, "output": 15.00, "cache_read": 0.30, "cache_write":  3.75},
     "claude-3-5-haiku":  {"input":  0.80, "output":  4.00, "cache_read": 0.08, "cache_write":  1.00},
-    # ponytail: Haiku 5.5 is tiered by prompt size; costs are priced from
-    # aggregates, so the <=100K-token tier is used. Prompts >100K tokens cost
-    # 5x (input 0.50, output 2.50, cache 0.05 / 0.625): price per turn if it matters.
+    # Haiku 5.5 is tiered by prompt size: these are the <=100K-token rates.
+    # Turns with a longer prompt cost LONG_PROMPT_MULTIPLIER times (see row_cost).
     "claude-haiku-5-5":  {"input":  0.10, "output":  0.50, "cache_read": 0.01, "cache_write":  0.125},
     # Fable / Mythos — Anthropic's most capable class, priced at 2x Opus.
     # (Mythos 5 shares Fable 5's pricing; Project-Glasswing access only.)
@@ -57,7 +59,10 @@ def get_pricing(model):
         return None
     if model in PRICING:
         return PRICING[model]
-    prefixes = [key for key in PRICING if model.startswith(key)]
+    # A key matches only up to a separator: "claude-fable-5-20260601" is Fable 5
+    # with a date suffix, not "claude-fable-5-2".
+    prefixes = [key for key in PRICING
+                if model.startswith(key) and not model[len(key)].isalnum()]
     if prefixes:
         return PRICING[max(prefixes, key=len)]
     # Substring fallback: match model family by keyword
@@ -72,16 +77,39 @@ def get_pricing(model):
         return PRICING["claude-haiku-4-5"]
     return None
 
-def calc_cost(model, inp, out, cache_read, cache_creation):
+# A 1-hour cache write costs 2x the input rate (a 5-minute write: 1.25x, the
+# cache_write column). Keep in sync with dashboard.py CACHE_WRITE_1H_MULTIPLIER.
+CACHE_WRITE_1H_MULTIPLIER = 2.0
+
+def calc_cost(model, inp, out, cache_read, cache_creation, cache_creation_1h=0):
+    """Cost in USD. cache_creation is the total; cache_creation_1h is the
+    part of it written with the 1-hour TTL."""
     p = get_pricing(model)
     if not p:
         return 0.0
     return (
-        inp            * p["input"]       / 1_000_000 +
-        out            * p["output"]      / 1_000_000 +
-        cache_read     * p["cache_read"]  / 1_000_000 +
-        cache_creation * p["cache_write"] / 1_000_000
+        inp        * p["input"]      / 1_000_000 +
+        out        * p["output"]     / 1_000_000 +
+        cache_read * p["cache_read"] / 1_000_000 +
+        (cache_creation - cache_creation_1h) * p["cache_write"] / 1_000_000 +
+        cache_creation_1h * p["input"] * CACHE_WRITE_1H_MULTIPLIER / 1_000_000
     )
+
+# Haiku 5.5 bills a turn whose prompt is over 100K tokens at 5x on every rate
+# (scanner.long_prompt_sums_sql selects those turns). Keep in sync with
+# dashboard.py LONG_PROMPT_MULTIPLIER.
+LONG_PROMPT_MULTIPLIER = 5.0
+LONG_PROMPT_SUMS = long_prompt_sums_sql()
+
+def row_cost(r):
+    """Cost of one query row: token sums of ONE model (inp/out/cr/cc/cc1h),
+    plus the sums of its long-prompt turns (long_*)."""
+    base = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0,
+                     r["cc"] or 0, r["cc1h"] or 0)
+    long_part = calc_cost(r["model"], r["long_input"] or 0, r["long_output"] or 0,
+                          r["long_cache_read"] or 0, r["long_cache_creation"] or 0,
+                          r["long_cache_creation_1h"] or 0)
+    return base + (LONG_PROMPT_MULTIPLIER - 1) * long_part
 
 def fmt(n):
     if n >= 1_000_000:
@@ -124,13 +152,15 @@ def cmd_today():
     conn = require_db()
     today = date.today().isoformat()
 
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT
             COALESCE(model, 'unknown') as model,
             SUM(input_tokens)          as inp,
             SUM(output_tokens)         as out,
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
+            SUM(cache_creation_1h_tokens) as cc1h,
+            {LONG_PROMPT_SUMS},
             COUNT(*)                   as turns
         FROM turns
         WHERE substr(timestamp, 1, 10) = ?
@@ -167,7 +197,7 @@ def cmd_today():
     total_cost = 0.0
 
     for r in rows:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = row_cost(r)
         total_cost += cost
         total_inp += r["inp"] or 0
         total_out += r["out"] or 0
@@ -196,7 +226,7 @@ def cmd_week():
     start = start_d.isoformat()
     end = today_d.isoformat()
 
-    by_day_model = conn.execute("""
+    by_day_model = conn.execute(f"""
         SELECT
             substr(timestamp, 1, 10)   as day,
             COALESCE(model, 'unknown') as model,
@@ -204,19 +234,23 @@ def cmd_week():
             SUM(output_tokens)         as out,
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
+            SUM(cache_creation_1h_tokens) as cc1h,
+            {LONG_PROMPT_SUMS},
             COUNT(*)                   as turns
         FROM turns
         WHERE substr(timestamp, 1, 10) BETWEEN ? AND ?
         GROUP BY day, model
     """, (start, end)).fetchall()
 
-    by_model = conn.execute("""
+    by_model = conn.execute(f"""
         SELECT
             COALESCE(model, 'unknown') as model,
             SUM(input_tokens)          as inp,
             SUM(output_tokens)         as out,
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
+            SUM(cache_creation_1h_tokens) as cc1h,
+            {LONG_PROMPT_SUMS},
             COUNT(*)                   as turns
         FROM turns
         WHERE substr(timestamp, 1, 10) BETWEEN ? AND ?
@@ -249,7 +283,7 @@ def cmd_week():
         bucket["turns"] += r["turns"]
         bucket["inp"]   += r["inp"] or 0
         bucket["out"]   += r["out"] or 0
-        bucket["cost"]  += calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        bucket["cost"]  += row_cost(r)
 
     print("  By Day:")
     for i in range(7):
@@ -263,7 +297,7 @@ def cmd_week():
     total_inp = total_out = total_cr = total_cc = total_turns = 0
     total_cost = 0.0
     for r in by_model:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = row_cost(r)
         total_cost  += cost
         total_inp   += r["inp"] or 0
         total_out   += r["out"] or 0
@@ -307,13 +341,15 @@ def cmd_stats():
     """).fetchone()
 
     # By model from turns (each turn has the actual model used)
-    by_model = conn.execute("""
+    by_model = conn.execute(f"""
         SELECT
             COALESCE(model, 'unknown') as model,
             SUM(input_tokens)          as inp,
             SUM(output_tokens)         as out,
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
+            SUM(cache_creation_1h_tokens) as cc1h,
+            {LONG_PROMPT_SUMS},
             COUNT(*)                   as turns,
             COUNT(DISTINCT session_id) as sessions
         FROM turns
@@ -363,7 +399,7 @@ def cmd_stats():
 
     # Build total cost across all models
     total_cost = sum(
-        calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        row_cost(r)
         for r in by_model
     )
 
@@ -390,7 +426,7 @@ def cmd_stats():
 
     print("  By Model:")
     for r in by_model:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = row_cost(r)
         print(f"    {r['model']:<30}  sessions={r['sessions']:<4}  turns={fmt(r['turns'] or 0):<6}  "
               f"in={fmt(r['inp'] or 0):<8}  out={fmt(r['out'] or 0):<8}  cost={fmt_cost(cost)}")
 

@@ -4,7 +4,13 @@
 
 ### Dashboard
 
-- Updated pricing to October 2026 (CLI, dashboard and README): added Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5. Opus 5.5 and Sonnet 5.5 had fallen back to Opus 4.8 / Sonnet 4.6 rates, which overstated their cost. Haiku 5.5 uses its ≤100K-token prompt tier. Also added every other model on the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing): Mythos 5.1, Opus 5, Opus 4.1, Opus 4, Sonnet 5, Sonnet 4 and Haiku 3.5. Prefix lookup now picks the longest matching key, so short keys such as `claude-opus-4` cannot capture newer dated ids such as `claude-opus-4-8-…`.
+- Fixed session cost for sessions that use several models. Recent Sessions, Cost by Project, Cost by Project / Branch, the sessions CSV and the cost sort priced all of a session's tokens, subagents included, at the session's primary model. A Fable session with Opus, Sonnet and Haiku subagents showed more than twice its real estimate. A session is now priced from its per-model rows, and the opened row's Main session line is the turns that no subagent made, so main thread + subagents = session cost.
+- Priced 1-hour cache writes at 2x the input rate (CLI and dashboard). They were priced at the 5-minute rate (1.25x), which understated cost.
+- Priced Haiku 5.5 turns whose prompt is over 100K tokens at the 5x long-prompt tier (CLI and dashboard). All Haiku 5.5 turns were priced at the lower tier.
+- Added Fable 5.2 and Mythos 5.2 pricing ($8 / $40 per MTok, cache write $10, cache read $0.20). They had fallen back to Fable 5 rates.
+- Fixed the price lookup so a date suffix is not read as a minor version: `claude-fable-5-20260601` is Fable 5, not `claude-fable-5-2`.
+
+- Updated pricing to October 2026 (CLI, dashboard and README): added Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5. Opus 5.5 and Sonnet 5.5 had fallen back to Opus 4.8 / Sonnet 4.6 rates, which overstated their cost. Also added every other model on the [pricing page](https://platform.claude.com/docs/en/about-claude/pricing): Mythos 5.1, Opus 5, Opus 4.1, Opus 4, Sonnet 5, Sonnet 4 and Haiku 3.5. Prefix lookup now picks the longest matching key, so short keys such as `claude-opus-4` cannot capture newer dated ids such as `claude-opus-4-8-…`.
 
 - Added a **Project Skills** section: a token chart and a table per project skill (from the project's `.claude/skills/` or `.agents/skills/`) with Uses, Auto / User split, Turns, Duration, estimated load tokens, Input, Output, Cache Read, Cache Creation, total Tokens, and Est. Cost, plus CSV export. A run's tokens are the main-thread turns after the skill loads, up to the next user prompt or skill load. User-level, plugin, and built-in commands are excluded.
 - Made **Recent Sessions** rows expandable: click a row (or press Enter on it) to see the project skills used in that session, with the same per-skill usage columns, and the subagents dispatched in that session with the Top Subagent Dispatches columns.
@@ -13,6 +19,7 @@
 
 ### Scanner
 
+- Added a `turns.cache_creation_1h_tokens` column: the 1-hour-TTL part of a turn's cache-creation tokens, with a one-time backfill from the transcripts still on disk. Turns of pruned transcripts stay at 0 and keep the 5-minute rate.
 - Added a `skill_events` table that records project-skill loads (model-started via the Skill tool, or typed as `/skill-name`) and user-prompt boundaries, with a one-time backfill for transcripts scanned before this version.
 - Fixed background (async) subagents showing as type "unknown" with no duration: their type is now read from the `subagents/agent-<id>.meta.json` file Claude Code writes beside each subagent transcript (already-scanned agents included), and their duration falls back to the time from first to last turn. Sparse agent records no longer erase stored values.
 - Fixed sessions showing project "unknown" when their transcript starts with a title record (no `cwd`): each scan now names them from the `cwd` stored on their turns, which also repairs existing rows.

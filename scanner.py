@@ -40,6 +40,27 @@ def _model_priority(model):
     return 0
 
 
+# Haiku 5.5 bills a request whose prompt is over 100K tokens at 5x on every
+# rate (cli.py LONG_PROMPT_MULTIPLIER). Costs are priced from aggregates, so
+# each priced aggregate also carries the token sums of those long-prompt turns.
+LONG_PROMPT_MODEL_PREFIX = "claude-haiku-5-5"
+LONG_PROMPT_THRESHOLD = 100_000
+
+
+def long_prompt_sums_sql(alias=""):
+    """SQL columns long_input ... long_cache_creation_1h: the token sums over
+    the long-prompt turns only. `alias` is the turns table prefix, e.g. "t."."""
+    is_long = (
+        f"{alias}model LIKE '{LONG_PROMPT_MODEL_PREFIX}%' AND "
+        f"{alias}input_tokens + {alias}cache_read_tokens + {alias}cache_creation_tokens"
+        f" > {LONG_PROMPT_THRESHOLD}"
+    )
+    return ",\n            ".join(
+        f"SUM(CASE WHEN {is_long} THEN {alias}{name}_tokens ELSE 0 END) as long_{name}"
+        for name in ("input", "output", "cache_read", "cache_creation", "cache_creation_1h")
+    )
+
+
 def get_db(db_path=DB_PATH):
     # Ensure the parent directory exists — on a fresh install or CI runner
     # ~/.claude may not yet exist, and sqlite3.connect needs the parent dir.
@@ -75,6 +96,7 @@ def init_db(conn):
             output_tokens           INTEGER DEFAULT 0,
             cache_read_tokens       INTEGER DEFAULT 0,
             cache_creation_tokens   INTEGER DEFAULT 0,
+            cache_creation_1h_tokens INTEGER DEFAULT 0,
             tool_name               TEXT,
             cwd                     TEXT,
             message_id              TEXT,
@@ -153,6 +175,10 @@ def init_db(conn):
     # column-add event), so it also covers DBs that gained the column from an
     # earlier build that predated the backfill.
     _ensure_column(conn, "sessions", "topic", "TEXT")
+    # The 1-hour-TTL part of cache_creation_tokens (priced at 2x input, not
+    # 1.25x). Rows scanned before this column existed are filled once by
+    # scan() via the schema_meta 'cache_1h_backfill_done' marker.
+    _ensure_column(conn, "turns", "cache_creation_1h_tokens", "INTEGER DEFAULT 0")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
@@ -493,6 +519,46 @@ def upsert_agents(conn, agents):
     ])
 
 
+def _cache_1h_tokens(usage):
+    """Return the 1-hour-TTL part of a usage block's cache-creation tokens.
+
+    Never more than cache_creation_input_tokens, so the 5-minute part
+    (total minus this) cannot go negative.
+    """
+    detail = usage.get("cache_creation")
+    one_hour = (detail.get("ephemeral_1h_input_tokens", 0) or 0) if isinstance(detail, dict) else 0
+    return max(0, min(one_hour, usage.get("cache_creation_input_tokens", 0) or 0))
+
+
+def _backfill_cache_1h(conn, jsonl_files):
+    """Fill cache_creation_1h_tokens for turns scanned before the column existed.
+
+    Reads the transcripts still on disk. Turns of pruned transcripts stay at 0
+    and are priced at the 5-minute rate. Returns the number of turns updated.
+    """
+    if conn.execute("SELECT 1 FROM turns LIMIT 1").fetchone() is None:
+        return 0
+    one_hour = {}  # message_id -> tokens (last record per id has the final tallies)
+    for filepath in jsonl_files:
+        try:
+            with open(filepath, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "ephemeral_1h_input_tokens" not in line:
+                        continue
+                    try:
+                        msg = json.loads(line).get("message")
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(msg, dict) and msg.get("id") and isinstance(msg.get("usage"), dict):
+                        one_hour[msg["id"]] = _cache_1h_tokens(msg["usage"])
+        except OSError:
+            continue
+    rows = [(tokens, mid) for mid, tokens in one_hour.items() if tokens]
+    conn.executemany(
+        "UPDATE turns SET cache_creation_1h_tokens = ? WHERE message_id = ?", rows)
+    return len(rows)
+
+
 def parse_jsonl_file(filepath):
     """Parse a JSONL file and return (session_metas, turns, agents, line_count).
 
@@ -608,6 +674,7 @@ def parse_jsonl_file(filepath):
                         "output_tokens": output_tokens,
                         "cache_read_tokens": cache_read,
                         "cache_creation_tokens": cache_creation,
+                        "cache_creation_1h_tokens": _cache_1h_tokens(usage),
                         "tool_name": tool_name,
                         "cwd": cwd,
                         "message_id": message_id,
@@ -739,13 +806,14 @@ def insert_turns(conn, turns):
     conn.executemany("""
         INSERT OR IGNORE INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id,
-             is_subagent, agent_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
+             tool_name, cwd, message_id, is_subagent, agent_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
+         t.get("cache_creation_1h_tokens", 0),
          t["tool_name"], t["cwd"], t.get("message_id", ""),
          t.get("is_subagent", 0), t.get("agent_id"))
         for t in turns
@@ -936,6 +1004,15 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True, c
         _meta_set(conn, "skill_backfill_done", "1")
         conn.commit()
 
+    # And for the 1-hour cache-write split (added after skills): without it,
+    # 1-hour cache writes of already-scanned turns stay priced at the 5-minute rate.
+    if _meta_get(conn, "cache_1h_backfill_done") != "1":
+        filled = _backfill_cache_1h(conn, jsonl_files)
+        _meta_set(conn, "cache_1h_backfill_done", "1")
+        conn.commit()
+        if verbose and filled:
+            print(f"Backfilled 1-hour cache writes for {filled} existing turn(s).")
+
     new_files = 0
     updated_files = 0
     skipped_files = 0
@@ -1084,6 +1161,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True, c
                                 "output_tokens": output_tokens,
                                 "cache_read_tokens": cache_read,
                                 "cache_creation_tokens": cache_creation,
+                                "cache_creation_1h_tokens": _cache_1h_tokens(usage),
                                 "tool_name": tool_name,
                                 "cwd": cwd,
                                 "message_id": message_id,

@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 
-from scanner import VERSION, init_db
+from scanner import VERSION, init_db, long_prompt_sums_sql
 
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
 
@@ -32,6 +32,19 @@ def _span_ms(start_ts, end_ts):
     except (AttributeError, ValueError):
         return None
     return max(0, int((t2 - t1).total_seconds() * 1000))
+
+
+TOKEN_KEYS = ("input", "output", "cache_read", "cache_creation", "cache_creation_1h")
+
+
+def _token_fields(r):
+    """The token sums of one query row, plus {"long": {...}} (the sums of its
+    long-prompt turns) when it has any."""
+    fields = {k: r[k] or 0 for k in TOKEN_KEYS}
+    long_sums = {k: r["long_" + k] or 0 for k in TOKEN_KEYS}
+    if any(long_sums.values()):
+        fields["long"] = long_sums
+    return fields
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -68,6 +81,8 @@ def get_dashboard_data(db_path=DB_PATH):
     # The project comes from the turn's session (same "unknown" fallback as
     # sessions_all), so the client's project filter can cut these rows too.
     PROJECT_EXPR = "COALESCE(NULLIF(s.project_name, ''), 'unknown')"
+    # Every token row also carries its long-prompt token sums (see _token_fields).
+    LONG_SUMS = long_prompt_sums_sql("t.")
     daily_rows = conn.execute(f"""
         SELECT
             substr(t.timestamp, 1, 10)   as day,
@@ -77,6 +92,8 @@ def get_dashboard_data(db_path=DB_PATH):
             SUM(t.output_tokens)         as output,
             SUM(t.cache_read_tokens)     as cache_read,
             SUM(t.cache_creation_tokens) as cache_creation,
+            SUM(t.cache_creation_1h_tokens) as cache_creation_1h,
+            {LONG_SUMS},
             COUNT(*)                   as turns
         FROM turns t
         LEFT JOIN sessions s ON s.session_id = t.session_id
@@ -88,10 +105,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "day":            r["day"],
         "model":          r["model"],
         "project":        r["project"],
-        "input":          r["input"] or 0,
-        "output":         r["output"] or 0,
-        "cache_read":     r["cache_read"] or 0,
-        "cache_creation": r["cache_creation"] or 0,
+        **_token_fields(r),
         "turns":          r["turns"] or 0,
     } for r in daily_rows]
 
@@ -158,6 +172,36 @@ def get_dashboard_data(db_path=DB_PATH):
             "cache_creation": r["total_cache_creation"] or 0,
         })
 
+    # ── Per-model token rows of each session (main thread and subagents apart) ─
+    # A session can span several models (subagents often run a cheaper one), so
+    # the client prices a session from these rows, never from its token totals.
+    session_model_rows = conn.execute(f"""
+        SELECT
+            session_id,
+            COALESCE(NULLIF(model, ''), 'unknown') as model,
+            COALESCE(is_subagent, 0)      as is_subagent,
+            SUM(input_tokens)             as input,
+            SUM(output_tokens)            as output,
+            SUM(cache_read_tokens)        as cache_read,
+            SUM(cache_creation_tokens)    as cache_creation,
+            SUM(cache_creation_1h_tokens) as cache_creation_1h,
+            {long_prompt_sums_sql()},
+            COUNT(*)                      as turns
+        FROM turns
+        GROUP BY session_id, COALESCE(NULLIF(model, ''), 'unknown'), COALESCE(is_subagent, 0)
+    """).fetchall()
+
+    by_model_of = {}
+    for r in session_model_rows:
+        by_model_of.setdefault(r["session_id"], []).append({
+            "model":             r["model"],
+            "is_subagent":       r["is_subagent"],
+            **_token_fields(r),
+            "turns":             r["turns"] or 0,
+        })
+    for session in sessions_all:
+        session["by_model"] = by_model_of.get(session["session_id"], [])
+
     # ── Subagent breakdown by type, by day & model ────────────────────────────
     # JOIN turns to agents (parent tool_result metadata captured by the scanner).
     # acompact-* ids are Claude Code's auto-compaction subagent (no parent
@@ -178,6 +222,8 @@ def get_dashboard_data(db_path=DB_PATH):
             SUM(t.output_tokens)                     as output,
             SUM(t.cache_read_tokens)                 as cache_read,
             SUM(t.cache_creation_tokens)             as cache_creation,
+            SUM(t.cache_creation_1h_tokens) as cache_creation_1h,
+            {LONG_SUMS},
             COUNT(DISTINCT t.agent_id)               as dispatches,
             COUNT(*)                                 as turns
         FROM turns t
@@ -193,10 +239,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "agent_type":     r["agent_type"],
         "model":          r["model"],
         "project":        r["project"],
-        "input":          r["input"] or 0,
-        "output":         r["output"] or 0,
-        "cache_read":     r["cache_read"] or 0,
-        "cache_creation": r["cache_creation"] or 0,
+        **_token_fields(r),
         "dispatches":     r["dispatches"] or 0,
         "turns":          r["turns"] or 0,
     } for r in subagent_daily_rows]
@@ -214,6 +257,8 @@ def get_dashboard_data(db_path=DB_PATH):
             SUM(t.output_tokens)                     as output,
             SUM(t.cache_read_tokens)                 as cache_read,
             SUM(t.cache_creation_tokens)             as cache_creation,
+            SUM(t.cache_creation_1h_tokens) as cache_creation_1h,
+            {LONG_SUMS},
             COUNT(*)                                 as turns,
             a.dispatched_in_session                  as parent_session,
             a.total_duration_ms                      as duration_ms,
@@ -234,10 +279,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "model":          r["model"],
         "start":          (r["start_ts"] or "")[:16].replace("T", " "),
         "start_date":     (r["start_ts"] or "")[:10],
-        "input":          r["input"] or 0,
-        "output":         r["output"] or 0,
-        "cache_read":     r["cache_read"] or 0,
-        "cache_creation": r["cache_creation"] or 0,
+        **_token_fields(r),
         "turns":          r["turns"] or 0,
         # Background agents report no duration: fall back to first..last turn.
         "duration_ms":    r["duration_ms"] if r["duration_ms"] is not None
@@ -251,7 +293,7 @@ def get_dashboard_data(db_path=DB_PATH):
     # thread. Attribute to a run the main-thread turns after its load, up to the
     # session's next event (a real user prompt or another skill load), so no
     # turn is counted twice. Cost stays per turn-model row, priced client-side.
-    skill_rows = conn.execute("""
+    skill_rows = conn.execute(f"""
         WITH runs AS (
             SELECT e.uuid, e.session_id, e.skill, e.source, e.load_chars,
                    e.timestamp AS start_ts,
@@ -269,6 +311,8 @@ def get_dashboard_data(db_path=DB_PATH):
             SUM(t.output_tokens)                     as output,
             SUM(t.cache_read_tokens)                 as cache_read,
             SUM(t.cache_creation_tokens)             as cache_creation,
+            SUM(t.cache_creation_1h_tokens) as cache_creation_1h,
+            {LONG_SUMS},
             MAX(t.timestamp)                         as last_ts
         FROM runs r
         LEFT JOIN turns t
@@ -291,10 +335,7 @@ def get_dashboard_data(db_path=DB_PATH):
             "load_tokens":    (r["load_chars"] or 0) // 4,
             "model":          r["model"],
             "turns":          r["turns"] or 0,
-            "input":          r["input"] or 0,
-            "output":         r["output"] or 0,
-            "cache_read":     r["cache_read"] or 0,
-            "cache_creation": r["cache_creation"] or 0,
+            **_token_fields(r),
             "duration_ms":    duration_ms,
         })
 
@@ -902,10 +943,12 @@ function tzDisplayName(tzMode) {
   }
 }
 
-// ── Pricing (Anthropic API, October 2026) ──────────────────────────────────
+// ── Pricing (Anthropic API, November 2026) ─────────────────────────────────
 // Keep in sync with cli.py PRICING. Keys are model-id prefixes; getPricing
 // picks the longest matching key. cache_write is the 5-minute rate.
 const PRICING = {
+  'claude-fable-5-2':  { input:  8.00, output: 40.00, cache_write: 10.00, cache_read: 0.20 },
+  'claude-mythos-5-2': { input:  8.00, output: 40.00, cache_write: 10.00, cache_read: 0.20 },
   'claude-fable-5-1':  { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 0.25 },
   'claude-mythos-5-1': { input: 10.00, output: 50.00, cache_write: 12.50, cache_read: 0.25 },
   'claude-opus-5-5':   { input:  4.00, output: 20.00, cache_write:  5.00, cache_read: 0.20 },
@@ -916,7 +959,7 @@ const PRICING = {
   'claude-sonnet-5':   { input:  2.00, output: 10.00, cache_write:  2.50, cache_read: 0.20 },
   'claude-sonnet-4':   { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
   'claude-3-5-haiku':  { input:  0.80, output:  4.00, cache_write:  1.00, cache_read: 0.08 },
-  // Haiku 5.5: <=100K-token prompt tier (see cli.py for the >100K rates).
+  // Haiku 5.5: the <=100K-token prompt tier; longer prompts: LONG_PROMPT_MULTIPLIER.
   'claude-haiku-5-5':  { input:  0.10, output:  0.50, cache_write:  0.125, cache_read: 0.01 },
   // Fable / Mythos — Anthropic's most capable class, priced at 2x Opus.
   // (Mythos 5 shares Fable 5's pricing; Project-Glasswing access only.)
@@ -944,7 +987,10 @@ function isBillable(model) {
 function getPricing(model) {
   if (!model) return null;
   if (PRICING[model]) return PRICING[model];
-  const prefix = Object.keys(PRICING).filter(k => model.startsWith(k))
+  // A key matches only up to a separator: "claude-fable-5-20260601" is Fable 5
+  // with a date suffix, not "claude-fable-5-2".
+  const prefix = Object.keys(PRICING)
+    .filter(k => model.startsWith(k) && !/[a-z0-9]/i.test(model[k.length]))
     .sort((a, b) => b.length - a.length)[0];
   if (prefix) return PRICING[prefix];
   const m = model.toLowerCase();
@@ -955,16 +1001,41 @@ function getPricing(model) {
   return null;
 }
 
-function calcCost(model, inp, out, cacheRead, cacheCreation) {
+// A 1-hour cache write costs 2x the input rate (a 5-minute write: 1.25x, the
+// cache_write column). Keep in sync with cli.py CACHE_WRITE_1H_MULTIPLIER.
+const CACHE_WRITE_1H_MULTIPLIER = 2.0;
+
+// cacheCreation is the total; cacheCreation1h is the part of it written with
+// the 1-hour TTL. Price only tokens of ONE model here: see rowCost/sessionCost.
+function calcCost(model, inp, out, cacheRead, cacheCreation, cacheCreation1h = 0) {
   if (!isBillable(model)) return 0;
   const p = getPricing(model);
   if (!p) return 0;
   return (
-    inp           * p.input       / 1e6 +
-    out           * p.output      / 1e6 +
-    cacheRead     * p.cache_read  / 1e6 +
-    cacheCreation * p.cache_write / 1e6
+    inp       * p.input      / 1e6 +
+    out       * p.output     / 1e6 +
+    cacheRead * p.cache_read / 1e6 +
+    (cacheCreation - cacheCreation1h) * p.cache_write / 1e6 +
+    cacheCreation1h * p.input * CACHE_WRITE_1H_MULTIPLIER / 1e6
   );
+}
+
+// Haiku 5.5 bills a turn whose prompt is over 100K tokens at 5x on every rate.
+// Keep in sync with cli.py LONG_PROMPT_MULTIPLIER.
+const LONG_PROMPT_MULTIPLIER = 5.0;
+
+// Cost of one server row: token sums of turns that all used r.model. r.long
+// holds the sums of its long-prompt turns. Price server rows only: a row
+// merged in the browser has lost r.long.
+function rowCost(r) {
+  const cost = t => calcCost(r.model, t.input, t.output, t.cache_read, t.cache_creation, t.cache_creation_1h || 0);
+  return cost(r) + (r.long ? (LONG_PROMPT_MULTIPLIER - 1) * cost(r.long) : 0);
+}
+
+// Cost of a session: the sum over its per-model rows. A session can span several
+// models (subagents), so never price its token totals at its primary model.
+function sessionCost(s) {
+  return (s.by_model || []).reduce((sum, r) => sum + rowCost(r), 0);
 }
 
 // ── Formatting ─────────────────────────────────────────────────────────────
@@ -1419,8 +1490,8 @@ function sortSessions(sessions) {
   return [...sessions].sort((a, b) => {
     let av, bv;
     if (sessionSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
+      av = sessionCost(a);
+      bv = sessionCost(b);
     } else if (sessionSortCol === 'duration_min') {
       av = parseFloat(a.duration_min) || 0;
       bv = parseFloat(b.duration_min) || 0;
@@ -1454,19 +1525,20 @@ function applyFilter() {
     d.output         += r.output;
     d.cache_read     += r.cache_read;
     d.cache_creation += r.cache_creation;
-    d.cost           += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+    d.cost           += rowCost(r);
   }
   const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
 
   // By model: aggregate tokens + turns from daily data
   const modelMap = {};
   for (const r of filteredDaily) {
-    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
+    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0, turns: 0, sessions: 0 };
     const m = modelMap[r.model];
     m.input          += r.input;
     m.output         += r.output;
     m.cache_read     += r.cache_read;
     m.cache_creation += r.cache_creation;
+    m.cost           += rowCost(r);
     m.turns          += r.turns;
   }
 
@@ -1493,7 +1565,7 @@ function applyFilter() {
     p.cache_creation += s.cache_creation;
     p.turns          += s.turns;
     p.sessions++;
-    p.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    p.cost += sessionCost(s);
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
@@ -1509,7 +1581,7 @@ function applyFilter() {
     pb.cache_creation += s.cache_creation;
     pb.turns          += s.turns;
     pb.sessions++;
-    pb.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    pb.cost += sessionCost(s);
   }
   const byProjectBranch = Object.values(projBranchMap).sort((a, b) => b.cost - a.cost);
 
@@ -1521,7 +1593,7 @@ function applyFilter() {
     output:         byModel.reduce((s, m) => s + m.output, 0),
     cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
     cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
-    cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
+    cost:           byModel.reduce((s, m) => s + m.cost, 0),
     subagent_tokens: (rawData.subagent_by_type || [])
       .filter(r => selectedModels.has(r.model) && projectOk(r.project) && (!start || r.day >= start) && (!end || r.day <= end))
       .reduce((s, r) => s + r.input + r.output + r.cache_read + r.cache_creation, 0),
@@ -1880,7 +1952,7 @@ function aggregateSkills(rows, start, end, sessionId) {
     m.turns += r.turns;
     m.input += r.input; m.output += r.output;
     m.cache_read += r.cache_read; m.cache_creation += r.cache_creation;
-    m.cost += calcCost(r.model, r.input, r.output, r.cache_read, r.cache_creation);
+    m.cost += rowCost(r);
   }
   return Object.values(map).map(({ runDur, ...m }) => ({
     ...m,
@@ -1961,25 +2033,26 @@ function renderSessionSkills(s) {
   const bySkill = aggregateSkills(rawData.skill_runs || [], null, null, sessionId);
   const dispatches = (rawData.top_dispatches || []).filter(d =>
     d.session_id === sessionId && selectedModels.has(d.model));
-  return detailTable('Main session', MAIN_HEADERS, [mainSessionRowHtml(s, dispatches)], '')
+  return detailTable('Main session', MAIN_HEADERS, [mainSessionRowHtml(s)], '')
        + detailTable('Project skills', SKILL_HEADERS, bySkill.map(skillRowHtml), 'No project skills ran in this session.')
        + detailTable('Subagents', DISPATCH_HEADERS, dispatches.map(dispatchRowHtml), 'No subagents ran in this session.');
 }
 
 const MAIN_HEADERS = ['Share', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Tokens', 'Est. Cost'];
 
-// Session totals include every subagent turn (scanner recomputes them from all
-// turns of the session), so the main thread is the total minus the dispatches.
-// Skill runs are windows of main-thread turns, so they stay inside this row.
-// Cost is priced at the session's primary model, as the session row is.
-function mainSessionRowHtml(s, dispatches) {
-  const sub = k => dispatches.reduce((a, d) => a + d[k], 0);
-  const main = { turns: s.turns - sub('turns'), input: s.input - sub('input'), output: s.output - sub('output'),
-                 cache_read: s.cache_read - sub('cache_read'), cache_creation: s.cache_creation - sub('cache_creation') };
+// The main thread is the session's turns that no subagent made. Skill runs are
+// windows of main-thread turns, so they stay inside this row. Each model's rows
+// are priced at that model's own rate, as the session row is.
+function mainSessionRowHtml(s) {
+  const main = { turns: 0, input: 0, output: 0, cache_read: 0, cache_creation: 0, cost: 0 };
+  for (const r of (s.by_model || [])) {
+    if (r.is_subagent) continue;
+    for (const k of ['turns', 'input', 'output', 'cache_read', 'cache_creation']) main[k] += r[k];
+    main.cost += rowCost(r);
+  }
   const total = o => o.input + o.output + o.cache_read + o.cache_creation;
   const all = total(s), tokens = total(main);
   const share = all ? Math.round(100 * tokens / all) + '%' : '—';
-  const cost = calcCost(s.model, main.input, main.output, main.cache_read, main.cache_creation);
   return `<tr>
       <td class="num muted">${share}</td>
       <td class="num">${main.turns}</td>
@@ -1988,7 +2061,7 @@ function mainSessionRowHtml(s, dispatches) {
       <td class="num">${fmt(main.cache_read)}</td>
       <td class="num">${fmt(main.cache_creation)}</td>
       <td class="num"><strong>${fmt(tokens)}</strong></td>
-      ${isBillable(s.model) ? `<td class="cost">${fmtCost(cost)}</td>` : '<td class="cost-na">n/a</td>'}
+      ${isBillable(s.model) ? `<td class="cost">${fmtCost(main.cost)}</td>` : '<td class="cost-na">n/a</td>'}
     </tr>`;
 }
 
@@ -2170,7 +2243,7 @@ const DISPATCH_HEADERS = ['Type', 'Started', 'Model', 'Turns', 'Tool Uses', 'Dur
 
 function dispatchRowHtml(d) {
     const tokensTotal = d.input + d.output + d.cache_read + d.cache_creation;
-    const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation);
+    const cost = rowCost(d);
     const costCell = isBillable(d.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
@@ -2242,7 +2315,7 @@ function renderSessionsTable(sessions) {
   const shown = sessions.slice(0, shownCount(sessionsLimit, sessions.length));
   if (!shown.some(s => s.session_id === openSession)) openSession = null;
   document.getElementById('sessions-body').innerHTML = shown.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    const cost = sessionCost(s);
     const costCell = isBillable(s.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
@@ -2290,8 +2363,8 @@ function sortModels(byModel) {
   return [...byModel].sort((a, b) => {
     let av, bv;
     if (modelSortCol === 'cost') {
-      av = calcCost(a.model, a.input, a.output, a.cache_read, a.cache_creation);
-      bv = calcCost(b.model, b.input, b.output, b.cache_read, b.cache_creation);
+      av = a.cost;
+      bv = b.cost;
     } else {
       av = a[modelSortCol] ?? 0;
       bv = b[modelSortCol] ?? 0;
@@ -2306,7 +2379,7 @@ function renderModelCostTable(byModel) {
   const sorted = sortModels(byModel);
   const shown = sorted.slice(0, shownCount(modelLimit, sorted.length));
   document.getElementById('model-cost-body').innerHTML = shown.map(m => {
-    const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
+    const cost = m.cost;
     const costCell = isBillable(m.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
@@ -2449,7 +2522,7 @@ function downloadCSV(reportType, header, rows) {
 function exportModelCSV() {
   const header = ['Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = sortModels(lastByModel).map(m => {
-    const cost = calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
+    const cost = m.cost;
     return [m.model, m.turns, m.input, m.output, m.cache_read, m.cache_creation, cost.toFixed(4)];
   });
   downloadCSV('cost_by_model', header, rows);
@@ -2458,7 +2531,7 @@ function exportModelCSV() {
 function exportSessionsCSV() {
   const header = ['Session', 'Project', 'Title', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = lastFilteredSessions.map(s => {
-    const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+    const cost = sessionCost(s);
     return [s.session_id, s.project, s.topic, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
   });
   downloadCSV('sessions', header, rows);
@@ -2484,7 +2557,7 @@ function exportDispatchesCSV() {
   const header = ['Type', 'Agent ID', 'Started', 'Model', 'Turns', 'Tool Uses', 'Duration (ms)', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Total Tokens', 'Est. Cost', 'Status'];
   const rows = lastFilteredDispatches.map(d => {
     const total = d.input + d.output + d.cache_read + d.cache_creation;
-    const cost = calcCost(d.model, d.input, d.output, d.cache_read, d.cache_creation);
+    const cost = rowCost(d);
     return [d.agent_type, d.agent_id, d.start, d.model, d.turns,
             d.tool_uses != null ? d.tool_uses : '', d.duration_ms != null ? d.duration_ms : '',
             d.input, d.output, d.cache_read, d.cache_creation, total, cost.toFixed(4), d.status || ''];
